@@ -1,0 +1,246 @@
+# syntax=docker/dockerfile:1.7
+# SGLang + KTransformers for CUDA 13, Blackwell SM120 and AMD Turin
+
+ARG BASE_IMAGE=lmsysorg/sglang:dev-cu13
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+ARG KTRANSFORMERS_REF=d1a3ed8a308cf45a2bdf8dc0ec18ea0cf782486c
+ARG SGL_KERNEL_WHEEL_VERSION=0.3.21
+ARG SGLANG_KIMI_PARSER_REF=af2a2ac618394a3c2d36c194f6b4ff346758ea7c
+ARG CUDNN_VERSION=9.16.0.29
+ARG KT_CUDA_ARCHS=120
+ARG KT_BUILD_JOBS=64
+
+ENV CUDA_HOME=/usr/local/cuda \
+    TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas \
+    HF_XET_HIGH_PERFORMANCE=1 \
+    CUDA_MODULE_LOADING=LAZY \
+    PYTORCH_ALLOC_CONF=expandable_segments:True \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_ROOT_USER_ACTION=ignore \
+    CPUINFER_CPU_INSTRUCT=NATIVE \
+    CPUINFER_ENABLE_AMX=OFF \
+    CPUINFER_ENABLE_AVX512_VNNI=ON \
+    CPUINFER_ENABLE_AVX512_BF16=ON \
+    CPUINFER_ENABLE_AVX512_VBMI=ON \
+    CPUINFER_USE_CUDA=1 \
+    CPUINFER_CUDA_ARCHS=${KT_CUDA_ARCHS} \
+    CPUINFER_PARALLEL=${KT_BUILD_JOBS}
+
+# Build dependencies and NUMA/topology support.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       build-essential \
+       cmake \
+       ninja-build \
+       git \
+       git-lfs \
+       curl \
+       ca-certificates \
+       pkg-config \
+       python3-dev \
+       libhwloc-dev \
+       libnuma-dev \
+       numactl \
+       pciutils \
+    && rm -rf /var/lib/apt/lists/* \
+    && git lfs install --system
+
+WORKDIR /opt
+
+# KTransformers and its matching SGLang fork.
+RUN git clone \
+       https://github.com/kvcache-ai/ktransformers.git \
+       /opt/ktransformers \
+    && cd /opt/ktransformers \
+    && git checkout --detach "${KTRANSFORMERS_REF}" \
+    && git submodule update --init --recursive
+
+# Replace the rolling base-image stack with the versions required by SGLang-KT.
+RUN (python3 -m pip uninstall -y \
+       sglang \
+       sglang-kt \
+       kt-kernel \
+       sglang-kernel \
+       sgl-kernel \
+       transformers-kt \
+       flashinfer-python \
+       flashinfer-cubin \
+       flashinfer-jit-cache \
+       flash-attn-4 || true) \
+    && python3 -m pip install --upgrade \
+       pip \
+       "setuptools<82" \
+       wheel \
+       packaging \
+    && python3 -m pip install --force-reinstall --no-deps \
+       "https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_WHEEL_VERSION}/sgl_kernel-${SGL_KERNEL_WHEEL_VERSION}%2Bcu130-cp312-abi3-manylinux2014_$(uname -m).whl" \
+    && cd /opt/ktransformers/third_party/sglang \
+    && export SGLANG_KT_VERSION="$(python3 -c \
+       'ns={}; exec(open("/opt/ktransformers/version.py").read(), ns); print(ns["__version__"])')" \
+    && python3 -m pip install \
+       "./python[all]" \
+       --extra-index-url https://download.pytorch.org/whl/cu130
+
+# Build kt-kernel for the current Turin host and Blackwell SM120.
+RUN cd /opt/ktransformers/kt-kernel \
+    && python3 -m pip install \
+       --no-deps \
+       --no-build-isolation \
+       -v .
+
+# Make Triton use the CUDA 13 PTX assembler.
+RUN triton_bin=/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin \
+    && if [ -d "${triton_bin}" ]; then \
+         rm -f "${triton_bin}/ptxas"; \
+         ln -s /usr/local/cuda/bin/ptxas "${triton_bin}/ptxas"; \
+       fi
+
+# Remove files left behind by the base image's flash-attn-4 package.
+RUN rm -rf /usr/local/lib/python3.12/dist-packages/flash_attn
+
+# Required by the BF16 Conv3d path used by Kimi multimodal models.
+RUN python3 -m pip install --force-reinstall --no-deps \
+    "nvidia-cudnn-cu13==${CUDNN_VERSION}"
+
+# RAWINT4 layerwise-prefill weight-restoration fix.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+path = Path(
+    "/usr/local/lib/python3.12/dist-packages/"
+    "sglang/srt/layers/moe/kt_ep_wrapper.py"
+)
+
+old = "torch.empty(_shape, dtype=_dtype, device=_device)))"
+new = (
+    "torch.empty(_shape, dtype=_dtype, device=_device), "
+    "requires_grad=False))"
+)
+
+source = path.read_text()
+if source.count(old) != 1:
+    raise RuntimeError(f"RAWINT4 patch target not found in {path}")
+
+source = source.replace(old, new, 1)
+compile(source, str(path), "exec")
+path.write_text(source)
+PY
+
+# Backport the compatible upstream Kimi parser and two later parser fixes.
+RUN curl -fsSL \
+      "https://raw.githubusercontent.com/sgl-project/sglang/${SGLANG_KIMI_PARSER_REF}/python/sglang/srt/function_call/kimik2_detector.py" \
+      -o /tmp/kimik2_detector.py \
+    && python3 - <<'PY'
+from pathlib import Path
+
+download = Path("/tmp/kimik2_detector.py")
+target = Path(
+    "/usr/local/lib/python3.12/dist-packages/"
+    "sglang/srt/function_call/kimik2_detector.py"
+)
+
+source = download.read_text()
+
+
+def replace_once(source: str, old: str, new: str, name: str) -> str:
+    if source.count(old) != 1:
+        raise RuntimeError(f"Kimi parser patch target not found: {name}")
+    return source.replace(old, new, 1)
+
+
+# The serving layer applies the conversation-history offset. The parser must
+# therefore return response-local tool indexes.
+old = '''            tool_calls = []
+            for match in function_call_tuples:
+                function_id, function_args = match
+                function_name, function_idx = self._parse_tool_call_id(
+                    function_id, tools, function_args
+                )
+                if function_name is None:
+                    continue
+
+                logger.debug(f"function_name {function_name}")
+
+                tool_calls.append(
+                    ToolCallItem(
+                        tool_index=function_idx,
+                        name=function_name,
+                        parameters=function_args,
+                    )
+                )
+'''
+
+new = '''            tool_calls = []
+            local_tool_index = 0
+            for match in function_call_tuples:
+                function_id, function_args = match
+                function_name, _ = self._parse_tool_call_id(
+                    function_id, tools, function_args
+                )
+                if function_name is None:
+                    continue
+
+                logger.debug(f"function_name {function_name}")
+
+                tool_calls.append(
+                    ToolCallItem(
+                        tool_index=local_tool_index,
+                        name=function_name,
+                        parameters=function_args,
+                    )
+                )
+                local_tool_index += 1
+'''
+
+source = replace_once(source, old, new, "response-local indexes")
+
+
+# Hold an incomplete streaming marker until its remaining characters arrive.
+old = '''        if not has_tool_call:
+            self._buffer = ""
+            normal_text = _strip_special_tokens(new_text)
+            return StreamingParseResult(normal_text=normal_text)
+'''
+
+new = '''        if not has_tool_call:
+            normal_text, self._buffer = self._split_pending_start(current_text)
+            return StreamingParseResult(
+                normal_text=_strip_special_tokens(normal_text)
+            )
+'''
+
+source = replace_once(source, old, new, "streaming marker buffering")
+
+
+anchor = '''    def structure_info(self) -> _GetInfoFunc:
+'''
+
+helper = '''    def _split_pending_start(self, text: str) -> tuple[str, str]:
+        """Retain a trailing fragment that may begin a tool marker."""
+        candidates = (self.bot_token, self.tool_call_start_token)
+        max_tail = max(len(token) for token in candidates) - 1
+
+        for length in range(min(len(text), max_tail), 1, -1):
+            tail = text[-length:]
+            if any(token.startswith(tail) for token in candidates):
+                return text[:-length], tail
+
+        return text, ""
+
+'''
+
+source = replace_once(source, anchor, helper + anchor, "streaming helper")
+
+compile(source, str(target), "exec")
+target.write_text(source)
+download.unlink()
+PY
+
+WORKDIR /workspace
+CMD ["bash"]
