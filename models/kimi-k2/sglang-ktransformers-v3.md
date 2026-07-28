@@ -4,7 +4,7 @@ SGLang and KTransformers image for hybrid CPU/GPU inference of the Kimi K2 model
 
 - [Dockerfile](Dockerfile.sglang-ktransformers-v3)
 
-This version has been tested in production with Kimi K2.7 Code RAWINT4, including agentic tool calling through GitHub Copilot BYOK.
+This version has been tested in production with Kimi K2.7 Code RAWINT4, including agentic tool calling.
 
 ## Tested configuration
 
@@ -17,11 +17,8 @@ This version has been tested in production with Kimi K2.7 Code RAWINT4, includin
 - Tensor parallelism: TP: 1
 - Maximum concurrent requests: 2
 - Context length: 163,840 tokens
-- Frontend: GitHub Copilot BYOK using the OpenAI Chat Completions API
 
 The same SGLang and KTransformers configuration should work with Kimi K2.6 and Kimi K2.5 by selecting the corresponding checkpoint and chat template. Only Kimi K2.7 Code RAWINT4 is benchmarked here.
-
-GitHub Copilot currently provides model-specific compatibility handling for Kimi K2.6 and Kimi K2.7 Code, but not Kimi K2.5.
 
 ## Component versions
 
@@ -237,7 +234,10 @@ The CPU-inference, context and memory settings are likewise tuned for the tested
 
 ## GitHub Copilot BYOK
 
-This configuration has been tested in production with GitHub Copilot BYOK:
+This configuration has been tested in production with GitHub Copilot BYOK when Kimi is used for the entire conversation.
+
+> [!WARNING]
+> At the time of publication, Kimi K2.7 Code works when used on its own in GitHub Copilot, but switching an existing conversation from another model to Kimi does not. See [microsoft/vscode#327794](https://github.com/microsoft/vscode/issues/327794).
 
 ```json
 {
@@ -259,6 +259,8 @@ This configuration has been tested in production with GitHub Copilot BYOK:
   ]
 }
 ```
+
+GitHub Copilot currently provides model-specific compatibility handling for Kimi K2.6 and Kimi K2.7 Code, but not Kimi K2.5.
 
 The model ID must contain one of these lowercase strings:
 
