@@ -1,0 +1,201 @@
+# syntax=docker/dockerfile:1.7
+
+# FreeToken runtime for Linux/x86-64, CUDA 13 and NVIDIA Blackwell SM120.
+#
+# The image is deliberately model-agnostic. At runtime pass one of the FreeToken
+# subcommands after the image name, for example:
+#
+#   freetoken-bw:v2 serve --model /models/example --host 0.0.0.0 --port 8000
+#   freetoken-bw:v2 bench bw --gpu 0 --dtype nvfp4,bf16
+#
+# A devel image is intentional: FreeToken and FlashInfer can JIT an uncovered
+# kernel variant at runtime and therefore need a CUDA 13 nvcc matching Torch cu130.
+
+ARG BASE_IMAGE=nvidia/cuda:13.0.1-devel-ubuntu24.04@sha256:84e5f33efdccadc21599978ea7e6ed80cbe19bb432f9c339b15a66c4025ac983
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG FREETOKEN_REF=2757bb5f91156fc8a44d88ec4b302a81f10c9e81
+ARG BUILD_JOBS=16
+
+# Build the companion cache for SM120 only. Set this to 0 for a quicker image
+# build; missing FreeToken TVM-FFI kernels will then compile into the mounted
+# runtime cache on first use.
+ARG BUILD_FREETOKEN_KERNEL_CACHE=1
+ARG FREETOKEN_KERNEL_CACHE_ARCHES=12.0
+
+LABEL org.opencontainers.image.title="FreeToken CUDA 13 / SM120 runtime" \
+      org.opencontainers.image.source="https://github.com/FlashML-org/FreeToken" \
+      org.opencontainers.image.revision="${FREETOKEN_REF}"
+
+ENV CUDA_HOME=/usr/local/cuda \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:/usr/local/cuda/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
+    CUDA_DEVICE_ORDER=PCI_BUS_ID \
+    TORCH_CUDA_ARCH_LIST=12.0 \
+    TVM_FFI_CUDA_ARCH_LIST=12.0 \
+    MAX_JOBS=${BUILD_JOBS} \
+    CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS} \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TOKENIZERS_PARALLELISM=false \
+    XDG_CACHE_HOME=/root/.cache \
+    HF_HOME=/root/.cache/huggingface \
+    HF_HUB_CACHE=/root/.cache/huggingface/hub \
+    TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions \
+    TRITON_CACHE_DIR=/root/.cache/triton
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        git \
+        libnuma-dev \
+        ninja-build \
+        numactl \
+        pciutils \
+        pkg-config \
+        python3.12 \
+        python3.12-dev \
+        python3.12-venv && \
+    python3.12 -m venv "${VIRTUAL_ENV}"
+
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    python -m pip install --upgrade \
+        "pip<27" \
+        "setuptools>=77" \
+        wheel \
+        ninja \
+        packaging && \
+    python -m pip install \
+        --extra-index-url https://download.pytorch.org/whl/cu130 \
+        "torch==2.11.0" \
+        "apache-tvm-ffi==0.1.13.post3"
+
+WORKDIR /opt/src
+
+RUN git init /opt/src/freetoken && \
+    git -C /opt/src/freetoken remote add origin https://github.com/FlashML-org/FreeToken.git && \
+    git -C /opt/src/freetoken fetch --depth 1 origin "${FREETOKEN_REF}" && \
+    git -C /opt/src/freetoken checkout --detach FETCH_HEAD && \
+    test "$(git -C /opt/src/freetoken rev-parse HEAD)" = "${FREETOKEN_REF}"
+
+# Downstream modification: add a strict readiness endpoint for orchestrators
+# such as llama-swap. /health remains HTTP 200 while loading so FreeToken clients
+# can display progress; /ready returns 503 until initialization has completed.
+RUN python - <<'PY'
+from pathlib import Path
+
+path = Path("/opt/src/freetoken/python/freetoken/server/control_api.py")
+source = path.read_text()
+
+import_line = "from fastapi import FastAPI\n"
+if import_line not in source:
+    raise RuntimeError("FreeToken control_api.py import layout changed")
+source = source.replace(
+    import_line,
+    import_line + "from fastapi.responses import JSONResponse\n",
+    1,
+)
+
+needle = '''    @app.get("/health")
+    async def health():
+        return build_health(get_state(), app.version)
+'''
+
+replacement = needle + '''
+    @app.get("/ready")
+    async def ready():
+        state = get_state()
+        document = build_health(state, app.version)
+        is_ready = (
+            getattr(state, "maintenance_state", "serving") == "serving"
+            and not getattr(state, "fatal_error", None)
+        )
+        return JSONResponse(
+            content=document,
+            status_code=200 if is_ready else 503,
+        )
+'''
+
+if needle not in source:
+    raise RuntimeError("FreeToken health route layout changed")
+
+path.write_text(source.replace(needle, replacement, 1))
+PY
+
+# Install the pinned runtime from source. --no-build-isolation is important:
+# the native extensions must link against the exact Torch/cu130 already installed.
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=cache,target=/root/.cache/torch_extensions,sharing=locked \
+    cd /opt/src/freetoken && \
+    python -m pip install --no-build-isolation \
+        --extra-index-url https://download.pytorch.org/whl/cu130 \
+        --extra-index-url https://docs.sglang.io/whl/cu130 \
+        --extra-index-url https://flashinfer.ai/whl \
+        --extra-index-url https://flashinfer.ai/whl/cu130 \
+        ".[accel]" && \
+    python -m pip install \
+        --extra-index-url https://flashinfer.ai/whl \
+        --extra-index-url https://flashinfer.ai/whl/cu130 \
+        flashinfer-cubin \
+        flashinfer-jit-cache
+
+# FreeToken's CPU MoE extension performs its own AVX-512/BF16 runtime dispatch.
+# No global -march is used, avoiding an unnecessary dependency on the build host's
+# exposed CPU while retaining the optimized path on AMD EPYC Turin.
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=cache,target=/root/.cache/freetoken-kernel-build,sharing=locked \
+    cd /opt/src/freetoken && \
+    if [[ "${BUILD_FREETOKEN_KERNEL_CACHE}" == "1" ]]; then \
+        FREETOKEN_KERNEL_CACHE_ARCHES="${FREETOKEN_KERNEL_CACHE_ARCHES}" \
+        FREETOKEN_KERNEL_CACHE_BUILD_DIR=/root/.cache/freetoken-kernel-build \
+        python -m pip install --no-build-isolation ./freetoken-kernel-cache; \
+    elif [[ "${BUILD_FREETOKEN_KERNEL_CACHE}" != "0" ]]; then \
+        echo "BUILD_FREETOKEN_KERNEL_CACHE must be 0 or 1" >&2; \
+        exit 2; \
+    fi
+
+# Static validation that does not require a GPU during docker build.
+RUN python - <<'PY'
+import importlib.metadata
+import importlib.util
+
+import flashinfer
+import freetoken
+import torch
+
+assert torch.__version__.startswith("2.11."), torch.__version__
+assert torch.version.cuda and torch.version.cuda.startswith("13."), torch.version.cuda
+assert importlib.util.find_spec("freetoken.kernel._pinned_tensor") is not None
+assert importlib.util.find_spec("freetoken.kernel._cpu_moe") is not None
+sgl_kernel_dist = importlib.metadata.distribution("sglang-kernel")
+assert any(
+    "common_ops" in str(path) and str(path).endswith(".so")
+    for path in (sgl_kernel_dist.files or [])
+), "sglang-kernel is installed but its common_ops shared library is missing"
+
+print("FreeToken:", getattr(freetoken, "__version__", "installed"))
+print("Torch:", torch.__version__, "CUDA:", torch.version.cuda)
+print("FlashInfer:", getattr(flashinfer, "__version__", "installed"))
+print("SGLang kernel:", sgl_kernel_dist.version)
+PY
+
+RUN ft --version && nvcc --version
+
+WORKDIR /workspace
+
+EXPOSE 8000
+STOPSIGNAL SIGTERM
+
+# Preserve NVIDIA's base-image entrypoint and make `ft` the user-facing command.
+# Arguments placed after the image name are therefore FreeToken CLI arguments.
+ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh", "ft"]
+CMD ["--help"]
