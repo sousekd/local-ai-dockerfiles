@@ -1,12 +1,12 @@
-# GLM 5.2 — FreeToken v2
+# GLM 5 — FreeToken v2
 
-FreeToken image and deployment recipe for hybrid CPU/GPU inference of GLM 5.2 on one NVIDIA Blackwell GPU.
+FreeToken image and deployment recipe for hybrid CPU/GPU inference of the GLM 5 model family on one NVIDIA Blackwell GPU.
 
 - [Dockerfile](Dockerfile.freetoken-v2)
 - [FreeToken](https://github.com/FlashML-org/FreeToken)
 - [NVIDIA GLM-5.2-NVFP4 checkpoint](https://huggingface.co/nvidia/GLM-5.2-NVFP4)
 
-This version has been tested with the NVIDIA NVFP4 checkpoint, two-request scheduling, radix prefix caching, reasoning output and OpenAI-compatible tool calling.
+This family-level recipe has been tested and benchmarked with the NVIDIA GLM-5.2 NVFP4 checkpoint. It also covers two-request scheduling, radix prefix caching, reasoning output and OpenAI-compatible tool calling.
 
 ## Tested configuration
 
@@ -113,17 +113,9 @@ The profile is GPU-specific. Re-run the bandwidth benchmark after changing the G
 
 ### Runtime memory allocation
 
-The launch recipe reserves 327,680 aggregate KV tokens for two requests. The tested initialization resolved to:
+With `--memory-ratio 0.94`, FreeToken allocated 29.06 GiB to 327,680 aggregate KV tokens and used the remaining model budget for 1,231 GPU expert slots. The 4.86 GiB left after CUDA graph capture is intentional runtime headroom, not a two-request concurrency limit.
 
-| Resource | Observed value |
-|---|---:|
-| KV capacity | 327,680 tokens |
-| KV allocation | 29.06 GiB |
-| GPU MoE cache | 1,231 expert slots |
-| Free VRAM after initialization | 4.92 GiB |
-| Free VRAM after CUDA graphs | 4.86 GiB |
-
-The final configuration leaves limited workspace headroom. Prefix caching is enabled with `--cache-type radix`, and `--enable-cache-report` exposes cache-hit counts in compatible API responses.
+Prefix caching is enabled with `--cache-type radix`, and `--enable-cache-report` exposes cache-hit counts in compatible API responses.
 
 ## Build
 
@@ -133,7 +125,7 @@ Run from the repository root:
 DOCKER_BUILDKIT=1 docker build \
   --progress=plain \
   --build-arg BUILD_JOBS=16 \
-  -f models/glm-5.2/Dockerfile.freetoken-v2 \
+  -f models/glm-5/Dockerfile.freetoken-v2 \
   -t freetoken-bw:v2 \
   .
 ```
@@ -289,7 +281,6 @@ These results describe this specific hybrid CPU/GPU placement and are not intend
 - The image targets Linux/x86-64, CUDA 13 and SM120. Its prebuilt FreeToken kernel cache is not portable to older NVIDIA architectures.
 - The tested recipe uses one 96 GB GPU and TP: 1.
 - The model weights are not included. The NVIDIA checkpoint is approximately 465 GB and must be downloaded separately.
-- The full two-request KV allocation leaves approximately 4.86 GiB after CUDA graph capture.
 - Loading the raw Hugging Face checkpoint builds expert banks and took approximately four minutes on the tested machine. FreeToken's optional FTW conversion can improve subsequent loading, but it was not used for these benchmark numbers.
 - Several Python dependencies are resolved from constrained ranges by pip rather than a lockfile. The component table records the exact versions in the tested image.
 - `/ready` is a downstream patch and should be removed if an equivalent strict readiness route is added upstream.
