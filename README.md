@@ -12,4 +12,5 @@ The configurations are hardware-oriented working recipes rather than universal i
 
 ## Models
 
+- [GLM 5.2 — FreeToken v2](models/glm-5.2/freetoken-v2.md)
 - [Kimi K2 — SGLang + KTransformers v3](models/kimi-k2/sglang-ktransformers-v3.md)
