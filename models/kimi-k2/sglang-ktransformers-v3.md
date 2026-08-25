@@ -3,6 +3,9 @@
 SGLang and KTransformers image for hybrid CPU/GPU inference of the Kimi K2 model family.
 
 - [Dockerfile](Dockerfile.sglang-ktransformers-v3)
+- [SGLang](https://github.com/sgl-project/sglang)
+- [KTransformers](https://github.com/kvcache-ai/ktransformers)
+- [Kimi K2.7 Code checkpoint](https://huggingface.co/moonshotai/Kimi-K2.7-Code)
 
 This version has been tested in production with Kimi K2.7 Code RAWINT4, including agentic tool calling.
 
