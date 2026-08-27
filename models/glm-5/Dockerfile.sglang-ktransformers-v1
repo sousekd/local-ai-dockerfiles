@@ -1,0 +1,266 @@
+# syntax=docker/dockerfile:1.7
+# SGLang + KTransformers for GLM-5.2 FP8 on RTX PRO 6000 Blackwell + EPYC Turin
+
+ARG CUDA_IMAGE=nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04@sha256:a2e1e2360c85298ac47ec2543b406ab1e8cec42e31ee47e4d32140ebc82e1067
+FROM ${CUDA_IMAGE}
+
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+# Immutable source revisions from the validated SM120 backport.
+ARG SGLANG_COMMIT=922c076bbd1258e542f7786c72be1b08fd1f7930
+ARG KTRANSFORMERS_COMMIT=340d6b118560731f15dc4cf1c8d20be625f64dee
+ARG DEEPGEMM_COMMIT=a6b593d2826719dcf4892609af7b84ee23aaf32a
+ARG FLASHINFER_COMMIT=5f2bdc41f9ffecef9d8ed590e688e7c0f108504f
+ARG KTRANSFORMERS_VERSION=0.6.3.post1
+ARG CUTLASS_DSL_VERSION=4.5.2
+ARG CMAKE_VERSION=3.31.1
+ARG BUILD_JOBS=16
+ARG NVCC_THREADS=4
+
+LABEL org.opencontainers.image.title="SGLang + KTransformers for GLM-5.2 FP8 on SM120" \
+      org.opencontainers.image.description="Pinned SM120 SGLang backport, KT-Kernel, DeepGEMM nv_dev, and FlashInfer sparse MLA" \
+      io.ktransformers.sglang.commit="${SGLANG_COMMIT}" \
+      io.ktransformers.ktransformers.commit="${KTRANSFORMERS_COMMIT}" \
+      io.ktransformers.deepgemm.commit="${DEEPGEMM_COMMIT}" \
+      io.ktransformers.flashinfer.commit="${FLASHINFER_COMMIT}"
+
+# SM120 build and JIT targets.
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    CCACHE_DIR=/root/.cache/ccache \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:/usr/local/cuda/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1 \
+    TORCH_CUDA_ARCH_LIST=12.0+PTX \
+    FLASHINFER_CUDA_ARCH_LIST=12.0f \
+    SGLANG_ENABLE_JIT_DEEPGEMM=1 \
+    PYTORCH_ALLOC_CONF=expandable_segments:True
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        ccache \
+        curl \
+        git \
+        git-lfs \
+        libhwloc-dev \
+        libnuma-dev \
+        libopenmpi-dev \
+        ninja-build \
+        numactl \
+        pkg-config \
+        python3.12 \
+        python3.12-dev \
+        python3.12-venv && \
+    python3.12 -m venv "${VIRTUAL_ENV}" && \
+    python -m pip install --upgrade \
+        pip \
+        "setuptools>=77,<82" \
+        wheel \
+        build \
+        "cmake==${CMAKE_VERSION}" \
+        pybind11 \
+        scikit-build-core && \
+    cmake --version | grep -F "cmake version ${CMAKE_VERSION}"
+
+WORKDIR /opt/src
+
+# Fetch exact commits rather than mutable branch heads. KTransformers' SGLang
+# submodule is deliberately not initialized: the external pinned checkout below
+# contains the SM120 backport required by this image.
+RUN git init /opt/src/sglang && \
+    git -C /opt/src/sglang remote add origin https://github.com/trilog-inc/sglang.git && \
+    git -C /opt/src/sglang fetch --depth=1 origin "${SGLANG_COMMIT}" && \
+    git -C /opt/src/sglang checkout --detach "${SGLANG_COMMIT}" && \
+    test "$(git -C /opt/src/sglang rev-parse HEAD)" = "${SGLANG_COMMIT}"
+
+RUN git init /opt/src/ktransformers && \
+    git -C /opt/src/ktransformers remote add origin https://github.com/trilog-inc/ktransformers.git && \
+    git -C /opt/src/ktransformers fetch --depth=1 origin "${KTRANSFORMERS_COMMIT}" && \
+    git -C /opt/src/ktransformers checkout --detach "${KTRANSFORMERS_COMMIT}" && \
+    test "$(git -C /opt/src/ktransformers rev-parse HEAD)" = "${KTRANSFORMERS_COMMIT}" && \
+    git -C /opt/src/ktransformers submodule update --init --recursive --depth=1 \
+        third_party/custom_flashinfer \
+        third_party/llama.cpp \
+        third_party/pybind11
+
+RUN git init /opt/src/deepgemm && \
+    git -C /opt/src/deepgemm remote add origin https://github.com/deepseek-ai/DeepGEMM.git && \
+    git -C /opt/src/deepgemm fetch --depth=1 origin "${DEEPGEMM_COMMIT}" && \
+    git -C /opt/src/deepgemm checkout --detach "${DEEPGEMM_COMMIT}" && \
+    test "$(git -C /opt/src/deepgemm rev-parse HEAD)" = "${DEEPGEMM_COMMIT}" && \
+    git -C /opt/src/deepgemm submodule update --init --recursive --depth=1
+
+RUN git init /opt/src/flashinfer && \
+    git -C /opt/src/flashinfer remote add origin https://github.com/flashinfer-ai/flashinfer.git && \
+    git -C /opt/src/flashinfer fetch --depth=1 origin "${FLASHINFER_COMMIT}" && \
+    git -C /opt/src/flashinfer checkout --detach "${FLASHINFER_COMMIT}" && \
+    test "$(git -C /opt/src/flashinfer rev-parse HEAD)" = "${FLASHINFER_COMMIT}" && \
+    git -C /opt/src/flashinfer submodule update --init --recursive --depth=1
+
+# Match the CUDA 12.9 wheel selection used by the backport's Docker recipe.
+# Installing Torch first prevents pip from satisfying SGLang with a generic
+# PyPI Torch build.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install \
+        --index-url https://download.pytorch.org/whl/cu129 \
+        torch==2.9.1 \
+        torchvision==0.24.1 \
+        torchaudio==2.9.1 && \
+    SGLANG_KT_VERSION="${KTRANSFORMERS_VERSION}" \
+    python -m pip install \
+        --extra-index-url https://download.pytorch.org/whl/cu129 \
+        "/opt/src/sglang/python[all]"
+
+# Rebuild sgl-kernel to include the branch's SM120 NSA top-k fixes. This step
+# also installs sgl-kernel's bundled DeepGEMM shim, so the newer SM120
+# DeepGEMM distribution is deliberately installed in the following layer.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cache/ccache \
+    CMAKE_BUILD_PARALLEL_LEVEL="${BUILD_JOBS}" \
+    CMAKE_ARGS="-DENABLE_BELOW_SM90=OFF -DSGL_KERNEL_COMPILE_THREADS=${NVCC_THREADS}" \
+    python -m pip install \
+        --no-build-isolation \
+        --no-deps \
+        --force-reinstall \
+        --verbose \
+        /opt/src/sglang/sgl-kernel
+
+# Install the SM120 DeepGEMM revision used by the report after sgl-kernel so
+# that deep_gemm._C and its Python sources are not shadowed by sgl-kernel's
+# older bundled DeepGEMM package. DG_FORCE_BUILD rejects binary fallbacks.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cache/ccache \
+    cd /opt/src/deepgemm && \
+    DG_FORCE_BUILD=1 MAX_JOBS="${BUILD_JOBS}" \
+    python -m pip install \
+        --no-build-isolation \
+        --no-deps \
+        --force-reinstall \
+        --verbose \
+        .
+
+# Replace the 0.6.3 FlashInfer wheel pulled by SGLang with the pinned source
+# revision containing the sparse-MLA SM120 API. flashinfer-cubin is intentionally
+# omitted: it downloads the complete generic 16k+ cubin catalogue, while this
+# image only needs the source/AOT-built SM120 sparse-MLA implementation.
+# FlashInfer 0.6.13 uses the pre-4.6 OperandMajorMode API; pinning Cutlass DSL
+# prevents SGLang's open-ended dependency from selecting incompatible 4.6.x.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cache/ccache \
+    cd /opt/src/flashinfer && \
+    python -m pip uninstall --yes \
+        flashinfer-cubin \
+        flashinfer-jit-cache \
+        nvidia-cutlass-dsl \
+        nvidia-cutlass-dsl-libs-base \
+        nvidia-cutlass-dsl-libs-cu12 \
+        nvidia-cutlass-dsl-libs-cu13 && \
+    python -m pip install \
+        "nvidia-cutlass-dsl==${CUTLASS_DSL_VERSION}" && \
+    CUTLASS_DSL_VERSION="${CUTLASS_DSL_VERSION}" python -c \
+        'import os; from importlib.metadata import version; from cutlass import cute; expected = os.environ["CUTLASS_DSL_VERSION"]; actual = version("nvidia-cutlass-dsl"); assert actual == expected, (actual, expected); assert hasattr(cute.nvgpu, "OperandMajorMode"), actual' && \
+    FLASHINFER_CUDA_ARCH_LIST=12.0f \
+    CMAKE_BUILD_PARALLEL_LEVEL="${BUILD_JOBS}" \
+    python -m pip install \
+        --no-build-isolation \
+        --no-deps \
+        --force-reinstall \
+        --verbose \
+        ".[cu12]"
+
+# Build the matching AOT cache in its own layer. The pinned FlashInfer AOT list
+# includes gen_sparse_mla_sm120_module() when FLASHINFER_CUDA_ARCH_LIST=12.0f,
+# so GLM-5.2's NSA prefill/decode kernel is packaged without requiring the
+# all-architecture flashinfer-cubin download.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cache/ccache \
+    cd /opt/src/flashinfer && \
+    FLASHINFER_CUDA_ARCH_LIST=12.0f \
+    CMAKE_BUILD_PARALLEL_LEVEL="${BUILD_JOBS}" \
+    python -m pip install \
+        --no-build-isolation \
+        --no-deps \
+        --force-reinstall \
+        --verbose \
+        ./flashinfer-jit-cache
+
+# Compile KT-Kernel specifically for Turin and SM120. This is intentionally a
+# native CPU build and should be built on the EPYC 9355 host where it will run.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cache/ccache \
+    cd /opt/src/ktransformers/kt-kernel && \
+    CPUINFER_BUILD_TYPE=Release \
+    CPUINFER_PARALLEL="${BUILD_JOBS}" \
+    CPUINFER_CPU_INSTRUCT=NATIVE \
+    CPUINFER_ENABLE_AMX=OFF \
+    CPUINFER_ENABLE_AVX512=ON \
+    CPUINFER_ENABLE_AVX512_VNNI=ON \
+    CPUINFER_ENABLE_AVX512_BF16=ON \
+    CPUINFER_ENABLE_AVX512_VBMI=ON \
+    CPUINFER_ENABLE_CPPTRACE=OFF \
+    CPUINFER_USE_CUDA=1 \
+    CPUINFER_CUDA_ARCHS=120 \
+    TORCH_CUDA_ARCH_LIST=12.0+PTX \
+    PIP_NO_BUILD_ISOLATION=1 \
+    bash ./install.sh build --manual
+
+# Build-time checks do not require a visible GPU. Runtime kernel execution is
+# validated when the container is launched through NVIDIA Container Toolkit.
+RUN CUTLASS_DSL_VERSION="${CUTLASS_DSL_VERSION}" python - <<'PY'
+import os
+from importlib.util import find_spec
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+
+required = ("torch", "sglang", "sgl_kernel", "kt_kernel", "deep_gemm", "flashinfer")
+missing = [name for name in required if find_spec(name) is None]
+assert not missing, f"missing Python packages: {missing}"
+
+deepgemm_root = Path(next(iter(find_spec("deep_gemm").submodule_search_locations)))
+assert list(deepgemm_root.glob("_C*.so")), "pinned deep_gemm._C extension is missing"
+
+import torch
+assert torch.__version__.startswith("2.9.1"), torch.__version__
+assert torch.version.cuda == "12.9", torch.version.cuda
+
+flashinfer_version = version("flashinfer-python")
+assert version("flashinfer-jit-cache") == flashinfer_version
+try:
+    version("flashinfer-cubin")
+except PackageNotFoundError:
+    pass
+else:
+    raise AssertionError("generic flashinfer-cubin package must not be installed")
+
+from cutlass import cute
+cutlass_dsl_version = version("nvidia-cutlass-dsl")
+assert cutlass_dsl_version == os.environ["CUTLASS_DSL_VERSION"], cutlass_dsl_version
+assert hasattr(cute.nvgpu, "OperandMajorMode"), cutlass_dsl_version
+
+from sglang.srt.layers.attention.nsa.flashinfer_sparse_mla import (
+    get_flashinfer_sparse_mla_op,
+)
+
+# Check the installed backport and API shape without invoking a CUDA kernel.
+import inspect
+
+parameters = inspect.signature(get_flashinfer_sparse_mla_op()).parameters
+for name in ("backend", "kv_scale_format", "out", "sparse_mla_top_k"):
+    assert name in parameters, f"FlashInfer sparse MLA API lacks {name}"
+
+sglang_root = Path(next(iter(find_spec("sglang").submodule_search_locations)))
+assert (sglang_root / "srt/layers/attention/nsa/flashinfer_sparse_mla.py").is_file()
+print("SGLang, SM120 sparse MLA, DeepGEMM, and KT-Kernel build checks passed")
+PY
+
+WORKDIR /workspace
+
+# No ENTRYPOINT: the operator controls the model, SGLang/KT flags, port,
+# environment, mounts, CPU affinity, and exact command at container launch.
+CMD ["/bin/bash"]
