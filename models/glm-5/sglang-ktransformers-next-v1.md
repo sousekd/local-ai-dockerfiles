@@ -12,7 +12,7 @@ This GLM 5 Next recipe has been tested and benchmarked with the official GLM-5.3
 ## Tested configuration
 
 - Model: `zai-org/GLM-5.3-Flash`
-- Model revision: `3f1971b7b5f7a528c9c4ef6212c8785298a8c24a`
+- Model revision: `04c4e9e95c5da8862dced7e5056455116f83a7e0`
 - Architecture: GLM-5-Next, approximately 321B parameters, 34 KDA layers and 11 DSA layers
 - Checkpoint and CPU expert method: FP8
 - Resident GPU routed experts: 0 per MoE layer
@@ -118,7 +118,7 @@ Set the Hugging Face cache, exact model snapshot and a persistent path for the p
 
 ```bash
 HF_HUB_CACHE=/path/to/huggingface/hub
-MODEL_SNAPSHOT=models--zai-org--GLM-5.3-Flash/snapshots/3f1971b7b5f7a528c9c4ef6212c8785298a8c24a
+MODEL_SNAPSHOT=models--zai-org--GLM-5.3-Flash/snapshots/04c4e9e95c5da8862dced7e5056455116f83a7e0
 PATCHED_CONFIG=/path/to/GLM-5.3-Flash-KTransformers.config.json
 
 HOST_CONFIG="${HF_HUB_CACHE}/${MODEL_SNAPSHOT}/config.json"
