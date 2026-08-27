@@ -1,0 +1,129 @@
+# syntax=docker/dockerfile:1.7
+# SGLang + KTransformers for GLM 5 Next, tested with GLM-5.3-Flash FP8 on RTX PRO 6000 Blackwell + EPYC Turin
+
+ARG CUDA_IMAGE=nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04@sha256:a2e1e2360c85298ac47ec2543b406ab1e8cec42e31ee47e4d32140ebc82e1067
+FROM ${CUDA_IMAGE}
+
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG KT_VERSION=0.7.0.post2
+ARG TRANSFORMERS_KT_VERSION=5.6.0.post4
+ARG CUDA_PYTHON_VERSION=13.2.0
+ARG CUTLASS_DSL_VERSION=4.3.5
+
+LABEL org.opencontainers.image.title="SGLang + KTransformers for GLM 5 Next on SM120" \
+      org.opencontainers.image.description="Pinned GLM-5.3-Flash KTransformers release wheels for CUDA 12.9 and SM120" \
+      io.ktransformers.version="${KT_VERSION}" \
+      io.ktransformers.transformers-kt.version="${TRANSFORMERS_KT_VERSION}"
+
+ENV CUDA_HOME=/usr/local/cuda \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:/usr/local/cuda/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
+    CUDA_DEVICE_ORDER=PCI_BUS_ID \
+    TORCH_CUDA_ARCH_LIST=12.0a \
+    FLASHINFER_CUDA_ARCH_LIST=12.0a \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TOKENIZERS_PARALLELISM=false
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        git \
+        libhwloc-dev \
+        libnuma-dev \
+        ninja-build \
+        numactl \
+        pciutils \
+        pkg-config \
+        python3.12 \
+        python3.12-dev \
+        python3.12-venv && \
+    python3.12 -m venv "${VIRTUAL_ENV}"
+
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    python -m pip install --upgrade \
+        "pip<27" \
+        "setuptools>=77,<82" \
+        wheel \
+        packaging && \
+    python -m pip install \
+        --index-url https://download.pytorch.org/whl/cu129 \
+        "torch==2.9.1" \
+        "torchvision==0.24.1" \
+        "torchaudio==2.9.1" && \
+    python -m pip install \
+        --extra-index-url https://download.pytorch.org/whl/cu129 \
+        "cuda-python==${CUDA_PYTHON_VERSION}" \
+        "nvidia-cutlass-dsl==${CUTLASS_DSL_VERSION}" \
+        "ktransformers[sglang]==${KT_VERSION}" \
+        "kt-kernel==${KT_VERSION}" \
+        "sglang-kt==${KT_VERSION}" \
+        "transformers-kt==${TRANSFORMERS_KT_VERSION}" && \
+    python -m pip check
+
+# The coordinated release splits the large SGL kernel payload across four
+# wheels. Validate every part and the exact manifest before publishing the image.
+RUN KT_VERSION="${KT_VERSION}" \
+    TRANSFORMERS_KT_VERSION="${TRANSFORMERS_KT_VERSION}" \
+    python - <<'PY'
+import os
+import runpy
+from importlib.metadata import distribution, version
+
+expected = {
+    "ktransformers": os.environ["KT_VERSION"],
+    "kt-kernel": os.environ["KT_VERSION"],
+    "sglang-kt": os.environ["KT_VERSION"],
+    "transformers-kt": os.environ["TRANSFORMERS_KT_VERSION"],
+}
+for package, wanted in expected.items():
+    actual = version(package)
+    assert actual == wanted, (package, actual, wanted)
+
+payloads = {
+    "kt-kernel": "sgl_kernel_kt_payload_core/payload.part",
+    "transformers-kt": "transformers_kt_sgl_kernel_payload/payload.part",
+    "sglang-kt": "sglang_kt_sgl_kernel_payload/payload.part",
+    "ktransformers": "ktransformers_sgl_kernel_payload/payload.part",
+}
+for package, relative_path in payloads.items():
+    path = distribution(package).locate_file(relative_path)
+    assert path.is_file() and path.stat().st_size > 50_000_000, path
+
+kt_dist = distribution("kt-kernel")
+kt_files = {str(path) for path in (kt_dist.files or ())}
+assert any("_kt_kernel_ext_avx512_bf16" in path for path in kt_files)
+
+manifest_path = kt_dist.locate_file("sgl_kernel/_payload_manifest.py")
+manifest = runpy.run_path(str(manifest_path))
+assert manifest["VERSION"] == "0.3.21.post2", manifest["VERSION"]
+assert manifest["ARCHIVE_SHA256"] == (
+    "d0425db6841266ec8fff9ea615294aca3bcd83a84176327f54f8de1687368f1a"
+)
+assert "sm100/common_ops.abi3.so" in manifest["FILES"]
+
+import torch
+
+assert torch.__version__.startswith("2.9.1+cu129"), torch.__version__
+assert torch.version.cuda == "12.9", torch.version.cuda
+print("Torch:", torch.__version__, "CUDA:", torch.version.cuda)
+print("KTransformers release:", expected["ktransformers"])
+print("SGL kernel payload:", manifest["VERSION"])
+PY
+
+RUN nvcc --version | grep -F "release 12.9"
+
+WORKDIR /workspace
+
+EXPOSE 8000
+STOPSIGNAL SIGTERM
+CMD ["bash"]
