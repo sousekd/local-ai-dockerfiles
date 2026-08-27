@@ -54,6 +54,8 @@ The image builds the complete accelerated path from fixed source revisions:
 - the DeepGEMM revision used by the backport;
 - FlashInfer sparse MLA for SM120.
 
+These forks were selected from the [SM120 GLM-5.2 report](https://github.com/kvcache-ai/ktransformers/issues/2083), which demonstrated a working FP8 stack on an RTX PRO 6000. The SGLang history carries the FlashInfer sparse-MLA, DeepGEMM `nv_dev`, NSA top-k and related SM120 fixes; the KTransformers fork mainly adds the matching source-build and external-SGLang install path. They are pinned as a coherent backport, not as a general preference over upstream.
+
 The KTransformers SGLang submodule is deliberately not installed. The separate pinned SGLang checkout contains the required SM120 changes.
 
 ### Native Turin and SM120 build
