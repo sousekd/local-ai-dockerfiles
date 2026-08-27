@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# SGLang + KTransformers for GLM-5.2 FP8 on RTX PRO 6000 Blackwell + EPYC Turin
+# SGLang + KTransformers for GLM 5 MoE DSA, tested with GLM-5.2 FP8 on RTX PRO 6000 Blackwell + EPYC Turin
 
 ARG CUDA_IMAGE=nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04@sha256:a2e1e2360c85298ac47ec2543b406ab1e8cec42e31ee47e4d32140ebc82e1067
 FROM ${CUDA_IMAGE}
@@ -17,7 +17,7 @@ ARG CMAKE_VERSION=3.31.1
 ARG BUILD_JOBS=16
 ARG NVCC_THREADS=4
 
-LABEL org.opencontainers.image.title="SGLang + KTransformers for GLM-5.2 FP8 on SM120" \
+LABEL org.opencontainers.image.title="SGLang + KTransformers for GLM 5 MoE DSA on SM120" \
       org.opencontainers.image.description="Pinned SM120 SGLang backport, KT-Kernel, DeepGEMM nv_dev, and FlashInfer sparse MLA" \
       io.ktransformers.sglang.commit="${SGLANG_COMMIT}" \
       io.ktransformers.ktransformers.commit="${KTRANSFORMERS_COMMIT}" \

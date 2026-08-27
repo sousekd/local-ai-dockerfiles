@@ -13,5 +13,5 @@ The configurations are hardware-oriented working recipes rather than universal i
 ## Models
 
 - [GLM 5 — FreeToken v2](models/glm-5/freetoken-v2.md) (for GLM 5.2 NVFP4)
-- [GLM 5 — SGLang + KTransformers v1](models/glm-5/sglang-ktransformers-v1.md) (for GLM 5, 5.1 and 5.2)
+- [GLM 5 MoE DSA — SGLang + KTransformers v1](models/glm-5/sglang-ktransformers-moe-dsa-v1.md) (for GLM 5, 5.1 and 5.2)
 - [Kimi K2 — SGLang + KTransformers v3](models/kimi-k2/sglang-ktransformers-v3.md) (for Kimi K2.5, 2.6 and 2.7 Code)

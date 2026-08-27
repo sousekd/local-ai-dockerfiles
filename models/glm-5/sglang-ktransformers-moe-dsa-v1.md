@@ -1,19 +1,19 @@
-# GLM 5 — SGLang + KTransformers v1
+# GLM 5 MoE DSA — SGLang + KTransformers v1
 
-SGLang and KTransformers image for hybrid CPU/GPU inference of the GLM 5 model family on one NVIDIA Blackwell GPU.
+SGLang and KTransformers image for hybrid CPU/GPU inference of the GLM 5 MoE DSA model family on one NVIDIA Blackwell GPU.
 
-- [Dockerfile](Dockerfile.sglang-ktransformers-v1)
+- [Dockerfile](Dockerfile.sglang-ktransformers-moe-dsa-v1)
 - [SGLang SM120 backport](https://github.com/trilog-inc/sglang/tree/922c076bbd1258e542f7786c72be1b08fd1f7930)
 - [KTransformers fork](https://github.com/trilog-inc/ktransformers/tree/340d6b118560731f15dc4cf1c8d20be625f64dee)
 - [GLM-5.2-FP8 checkpoint](https://huggingface.co/zai-org/GLM-5.2-FP8)
 
-This family-level recipe has been tested and benchmarked with the GLM-5.2 FP8 checkpoint. It uses the native KT-Kernel CPU backend, layerwise GPU prefill, FlashInfer sparse MLA attention and DeepGEMM on SM120.
+This GLM 5 MoE DSA family recipe has been tested and benchmarked with the GLM-5.2 FP8 checkpoint. It uses the native KT-Kernel CPU backend, layerwise GPU prefill, FlashInfer sparse MLA attention and DeepGEMM on SM120.
 
 ## Tested configuration
 
 - Model: `zai-org/GLM-5.2-FP8`
 - Model revision: `ba978f7d347eaf65d22f1a86833408afdb953541`
-- Architecture: GLM-5.2, 753B total parameters and 40B activated
+- Architecture: GLM MoE DSA (GLM-5.2), 753B total parameters and 40B activated
 - Checkpoint and CPU expert method: FP8
 - Resident GPU routed experts: 0 per MoE layer
 - CPU expert backend: AVX-512 BF16
@@ -101,7 +101,7 @@ DOCKER_BUILDKIT=1 docker build \
   --progress=plain \
   --build-arg BUILD_JOBS=16 \
   --build-arg NVCC_THREADS=4 \
-  -f models/glm-5/Dockerfile.sglang-ktransformers-v1 \
+  -f models/glm-5/Dockerfile.sglang-ktransformers-moe-dsa-v1 \
   -t sglang-kt-glm:v1 \
   .
 ```
