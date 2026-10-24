@@ -16,3 +16,5 @@ The configurations are hardware-oriented working recipes rather than universal i
 - [GLM 5 MoE DSA — SGLang + KTransformers v1](models/glm-5/sglang-ktransformers-moe-dsa-v1.md) (for GLM 5, 5.1, 5.2 and 5.3)
 - [GLM 5 Next — SGLang + KTransformers v1](models/glm-5/sglang-ktransformers-next-v1.md) (for GLM 5.3 Flash)
 - [Kimi K2 — SGLang + KTransformers v3](models/kimi-k2/sglang-ktransformers-v3.md) (for Kimi K2.5, 2.6 and 2.7 Code)
+- [DeepSeek V3.2 — SGLang + KTransformers v2](models/deepseek-v3.2/sglang-ktransformers-v2.md) (for DeepSeek V3.2 FP8)
+

@@ -1,0 +1,337 @@
+# syntax=docker/dockerfile:1.7
+# SGLang + KTransformers for DeepSeek V3.2 FP8 on RTX PRO 6000 Blackwell + EPYC Turin
+
+ARG CUDA_IMAGE=nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04@sha256:e071e85c52ad91fc9ea24158ff5330876b2d1a5c4ac83ccc6066976835873c01
+FROM ${CUDA_IMAGE}
+
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+ARG DEBIAN_FRONTEND=noninteractive
+ARG KT_COMMIT=a694e718e8b3ec2e221277d674e369f3be38d2a4
+# SGLang revision with SM120 sparse-MLA and NSA top-k support.
+ARG SGLANG_COMMIT=922c076bbd1258e542f7786c72be1b08fd1f7930
+ARG DEEPGEMM_COMMIT=a6b593d2826719dcf4892609af7b84ee23aaf32a
+ARG FLASHINFER_COMMIT=5f2bdc41f9ffecef9d8ed590e688e7c0f108504f
+ARG BUILD_JOBS=24
+ARG NVCC_THREADS=1
+
+LABEL org.opencontainers.image.title="KTransformers DeepSeek V3.2 FP8 on SM120" \
+      io.ktransformers.revision="${KT_COMMIT}" \
+      io.sglang.revision="${SGLANG_COMMIT}" \
+      io.deepgemm.revision="${DEEPGEMM_COMMIT}" \
+      io.flashinfer.revision="${FLASHINFER_COMMIT}"
+
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:/usr/local/cuda/bin:${PATH} \
+    CUDA_HOME=/usr/local/cuda \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
+    TORCH_CUDA_ARCH_LIST=12.0 \
+    FLASHINFER_CUDA_ARCH_LIST=12.0f \
+    TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas \
+    MAX_JOBS=${BUILD_JOBS} \
+    CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS} \
+    CUDA_DEVICE_ORDER=PCI_BUS_ID \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TOKENIZERS_PARALLELISM=false \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    test "$(uname -m)" = x86_64 && apt-get update && \
+    apt-get install -y --no-install-recommends \
+      build-essential ca-certificates ccache curl git ninja-build pkg-config \
+      libnuma-dev libhwloc-dev libopenmpi-dev numactl libgl1 libglib2.0-0 \
+      python3.12 python3.12-dev python3.12-venv && \
+    python3.12 -m venv "${VIRTUAL_ENV}"
+
+# Dependency constraints for the pinned CUDA 13 stack.
+COPY <<'CONSTRAINTS' /opt/constraints.txt
+torch==2.9.1+cu130
+torchvision==0.24.1+cu130
+torchaudio==2.9.1+cu130
+triton==3.5.1
+transformers-kt==5.6.0.post6
+accelerate-kt==1.14.0.post4
+huggingface-hub==1.33.0
+tokenizers==0.22.2
+safetensors==0.8.0
+numpy==2.5.4
+compressed-tensors==0.15.0.1
+xgrammar==0.1.27
+nvidia-cutlass-dsl==4.5.2
+quack-kernels==0.3.3
+apache-tvm-ffi==0.1.11
+cuda-python==13.2.0
+cuda-bindings==13.2.0
+cuda-tile==1.7.0
+tilelang==0.1.10
+setuptools==80.9.0
+wheel==0.45.1
+cmake==3.31.6
+pybind11==3.0.1
+packaging==25.0
+scikit-build-core==1.1.1
+CONSTRAINTS
+ENV PIP_CONSTRAINT=/opt/constraints.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    python -m pip install pip==26.2.1 setuptools wheel cmake pybind11 \
+      packaging ninja scikit-build-core apache-tvm-ffi && \
+    python -m pip install --extra-index-url https://download.pytorch.org/whl/cu130 \
+      torch torchvision torchaudio
+
+WORKDIR /opt/src
+RUN <<'SH'
+fetch() {
+    git init "$1"
+    git -C "$1" remote add origin "$2"
+    git -C "$1" fetch --depth=1 origin "$3"
+    git -C "$1" checkout --detach FETCH_HEAD
+    test "$(git -C "$1" rev-parse HEAD)" = "$3"
+}
+fetch ktransformers https://github.com/kvcache-ai/ktransformers.git "$KT_COMMIT"
+fetch sglang https://github.com/trilog-inc/sglang.git "$SGLANG_COMMIT"
+fetch deepgemm https://github.com/deepseek-ai/DeepGEMM.git "$DEEPGEMM_COMMIT"
+fetch flashinfer https://github.com/flashinfer-ai/flashinfer.git "$FLASHINFER_COMMIT"
+git -C ktransformers submodule update --init --recursive --depth=1 third_party/llama.cpp third_party/pybind11 third_party/custom_flashinfer
+git -C deepgemm submodule update --init --recursive --depth=1
+git -C flashinfer submodule update --init --recursive --depth=1 3rdparty/cutlass 3rdparty/cccl 3rdparty/spdlog
+SH
+
+# Source compatibility patches; exact anchors enforce the pinned revisions.
+RUN python - <<'PY'
+from pathlib import Path
+
+def replace(path, old, new, count=1):
+    text = path.read_text()
+    assert text.count(old) == count, f"Patch anchor changed: {path}: {old[:70]}"
+    path.write_text(text.replace(old, new))
+
+sg = Path("/opt/src/sglang/python")
+project = sg / "pyproject.toml"
+replace(project, '"flashinfer_python==0.6.3"', '"flashinfer_python==0.6.13"')
+replace(project, '  "flashinfer_cubin==0.6.3",\n', '')
+replace(project, '"quack-kernels==0.2.4"', '"quack-kernels==0.3.3"')
+replace(project, '"transformers-kt==5.6.0.post1"', '"transformers-kt==5.6.0.post6"')
+
+# Load the real V3.2 config as a typed V3 config, retaining DSA/indexer, YaRN
+# and quantization fields. Do not use this fork's unrelated V4 config backup.
+hf = sg / "sglang/srt/utils/hf_transformers_utils.py"
+helper = '''def _deepseek_v32_config(model):
+    path = Path(model) / "config.json"
+    if not path.is_file():
+        return None
+    raw = json.loads(path.read_text())
+    if raw.get("model_type") != "deepseek_v32":
+        return None
+    raw.pop("model_type")
+    raw["architectures"] = ["DeepseekV3ForCausalLM"]
+    return AutoConfig.for_model("deepseek_v3", **raw)
+
+
+'''
+replace(hf, '# Temporary hack for DeepSeek-V3.2 model\n',
+        helper + '# Temporary hack for DeepSeek-V3.2 model\n')
+replace(hf, '    if "mistral-large-3" in str(model).lower():\n',
+        '    compat = _deepseek_v32_config(model)\n'
+        '    if compat is not None:\n        config = compat\n'
+        '    elif "mistral-large-3" in str(model).lower():\n')
+replace(hf, '    try:\n        tokenizer = AutoTokenizer.from_pretrained(\n',
+        '    if "config" not in kwargs:\n'
+        '        compat = _deepseek_v32_config(tokenizer_name)\n'
+        '        if compat is not None:\n            kwargs["config"] = compat\n'
+        '    try:\n        tokenizer = AutoTokenizer.from_pretrained(\n')
+
+# The same NSA pool writes the same 656-byte layout for DeepSeek and GLM:
+# 512 FP8 values + four FP32 scales + 64 BF16 RoPE values. The backport already
+# passes kv_scale_format="arbitrary_fp32". Retain its other safety checks.
+args = sg / "sglang/srt/server_args.py"
+replace(args, '''        if model_arch != "GlmMoeDsaForCausalLM":
+            raise ValueError(
+                "flashinfer_sparse_mla currently supports GlmMoeDsaForCausalLM "
+                "only because SGLang's packed KV cache uses GLM arbitrary-FP32 "
+                "scale semantics."
+            )
+''', '''        if model_arch not in ("GlmMoeDsaForCausalLM", "DeepseekV3ForCausalLM"):
+            raise ValueError("This sparse-MLA build supports GLM DSA and DeepSeek V3.2")
+''')
+
+# Prevent FlashInfer's build hook from silently installing another CUDA stack.
+# This image uses its CUDA C++ sparse-MLA backend, not its cuTile compiler.
+replace(Path("/opt/src/flashinfer/build_backend.py"),
+        '    _install_cuda_tile_compile_deps()\n',
+        '    # Dependencies are installed explicitly by the Dockerfile.\n', 2)
+
+# Retain every common_ops kernel and its upstream bindings; trim only build
+# targets. The loader uses the precise-math sm100/ library for SM120 as well.
+kernel = Path("/opt/src/sglang/sgl-kernel")
+cmake = kernel / "CMakeLists.txt"
+text = cmake.read_text()
+for start, end in [
+    ('# DeepGEMM\n', '# Triton kernel\n'),  # Separate DeepGEMM build below.
+    ('# =========================== Common SM90 Build',
+     '# =========================== Common SM100+ Build'),
+    ('# ============================ Optional Install: FA3', '# Build spatial_ops'),
+    ('# ============================ Extra Install: FLashMLA',
+     '# ============================ Extra Install: triton kernels'),
+]:
+    assert text.count(start) == text.count(end) == 1, (start, end)
+    a, b = text.index(start), text.index(end)
+    assert a < b
+    text = text[:a] + text[b:]
+cmake.write_text(text)
+replace(cmake, 'find_package(CUDAToolkit REQUIRED)\n', '''find_package(CUDAToolkit REQUIRED)
+# CUDA 13 moved CCCL headers; nvcc finds them automatically, host C++ does not.
+find_path(SGL_CCCL_INCLUDE_DIR cuda/atomic
+    HINTS ${CUDAToolkit_INCLUDE_DIRS} PATH_SUFFIXES cccl NO_DEFAULT_PATH REQUIRED)
+include_directories(SYSTEM "${SGL_CCCL_INCLUDE_DIR}")
+message(STATUS "SGL CCCL headers: ${SGL_CCCL_INCLUDE_DIR}")
+''')
+replace(cmake, 'target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)\n', '')
+replace(cmake, '''target_compile_definitions(common_ops_sm90_build PRIVATE
+    FLASHATTENTION_DISABLE_BACKWARD
+    FLASHATTENTION_DISABLE_DROPOUT
+    FLASHATTENTION_DISABLE_UNEVEN_K
+)
+''', '')
+replace(cmake, 'install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)\n', '')
+replace(cmake, 'set(MSCCLPP_BUILD_TESTS OFF)\n',
+        'set(MSCCLPP_BUILD_TESTS OFF)\nset(MSCCLPP_BUILD_PYTHON_BINDINGS OFF)\n'
+        'set(MSCCLPP_BUILD_APPS_NCCL OFF)\n')
+replace(cmake, 'target_link_libraries(common_ops_sm100_build PRIVATE',
+        'set_target_properties(mscclpp_obj PROPERTIES CUDA_ARCHITECTURES 120a)\n'
+        'target_link_libraries(common_ops_sm100_build PRIVATE')
+replace(cmake, '# All source files\n', '''# Compile the retained kernels only for RTX PRO 6000 / SM120a.
+list(FILTER SGL_KERNEL_CUDA_FLAGS EXCLUDE REGEX "^-gencode=")
+list(APPEND SGL_KERNEL_CUDA_FLAGS "-gencode=arch=compute_120a,code=sm_120a")
+
+# All source files
+''')
+assert 'common_ops_sm90_build' not in cmake.read_text()
+replace(kernel / 'pyproject.toml', 'version = "0.3.21"', 'version = "0.3.21+ds32.sm120"')
+replace(kernel / 'python/sgl_kernel/version.py', '__version__ = "0.3.21"',
+        '__version__ = "0.3.21+ds32.sm120"')
+PY
+
+# Redirect wheel dependencies to transformers-kt, which owns the transformers
+# Python namespace. Repacking updates dependency metadata and RECORD only.
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked <<'SH'
+python -m pip download --no-deps --only-binary=:all: -d /tmp/deps compressed-tensors xgrammar
+for whl in /tmp/deps/*.whl; do python -m wheel unpack -d /tmp/unpacked "$whl"; done
+python - <<'PY'
+from pathlib import Path
+for name, minimum in [('compressed_tensors', '4.45.0'), ('xgrammar', '4.38.0')]:
+    path = next(Path('/tmp/unpacked').glob(f'{name}-*/*.dist-info/METADATA'))
+    text = path.read_text()
+    old = f'Requires-Dist: transformers>={minimum}\n'
+    assert text.count(old) == 1, f'Unexpected {name} metadata'
+    path.write_text(text.replace(old, 'Requires-Dist: transformers-kt==5.6.0.post6\n'))
+PY
+mkdir -p /tmp/patched
+for dir in /tmp/unpacked/*; do python -m wheel pack -d /tmp/patched "$dir"; done
+python -m pip install --no-deps /tmp/patched/*.whl
+SH
+
+# Install locally versioned FlashInfer and sgl-kernel builds before SGLang
+# to satisfy its dependencies without substituting public wheels.
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    FLASHINFER_LOCAL_VERSION=ds32 python -m pip install -v --no-deps \
+      --no-build-isolation /opt/src/flashinfer
+
+# Build sgl-kernel for SM120a with upstream math flags and the NSA top-k fix.
+# Cache CMake/Ninja output and fetched dependencies for incremental builds.
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=cache,target=/root/.cache/ccache,sharing=locked \
+    --mount=type=cache,id=ds32-sgl-cu130-sm120,target=/opt/build/sgl-kernel,sharing=locked \
+    CCACHE_DIR=/root/.cache/ccache \
+    CMAKE_ARGS="-DENABLE_BELOW_SM90=OFF -DCMAKE_CUDA_ARCHITECTURES=OFF -DSGL_KERNEL_COMPILE_THREADS=${NVCC_THREADS}" \
+    python -m pip install -v --no-build-isolation --no-deps \
+      -Cbuild-dir=/opt/build/sgl-kernel -Cbuild.verbose=true \
+      /opt/src/sglang/sgl-kernel
+
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    SGLANG_KT_VERSION=0.6.3.post1+ds32 python -m pip install -v --no-build-isolation \
+      --extra-index-url https://download.pytorch.org/whl/cu130 \
+      /opt/src/sglang/python accelerate-kt cuda-tile tilelang && \
+    python -m pip check
+
+# Install the pinned standalone DeepGEMM build.
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    DG_FORCE_BUILD=1 python -m pip install -v --no-build-isolation --no-deps \
+      /opt/src/deepgemm
+
+# Build the KTransformers AVX-512 BF16/VBMI CPU backend and SM120 CUDA support.
+# Explicit instruction flags avoid dependence on build-host CPU detection.
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    CPUINFER_CPU_INSTRUCT=AVX512 CPUINFER_NATIVE=OFF \
+    CPUINFER_ENABLE_AMX=OFF CPUINFER_ENABLE_AVX512=ON \
+    CPUINFER_ENABLE_AVX512_VNNI=ON CPUINFER_ENABLE_AVX512_BF16=ON \
+    CPUINFER_ENABLE_AVX512_VBMI=ON CPUINFER_ENABLE_CPPTRACE=OFF \
+    CPUINFER_USE_CUDA=1 CPUINFER_CUDA_ARCHS=120 \
+    CPUINFER_PARALLEL="${BUILD_JOBS}" \
+    python -m pip install -v --no-build-isolation /opt/src/ktransformers/kt-kernel
+
+# Precompile SM120 sparse MLA without a build-time GPU. Install the module
+# outside /root/.cache to keep it accessible when runtime caches are mounted.
+RUN FLASHINFER_WORKSPACE_BASE=/tmp/fi-build python - <<'PY'
+import shutil
+from flashinfer.jit.mla import gen_sparse_mla_sm120_module
+spec = gen_sparse_mla_sm120_module()
+spec.build(verbose=True)
+spec.aot_path.parent.mkdir(parents=True, exist_ok=True)
+shutil.copy2(spec.jit_library_path, spec.aot_path)
+assert spec.is_aot
+PY
+
+# Allow NSA SM-count configuration when the optional DeepGEMM GEMM dispatcher
+# is disabled by importing DeepGEMM locally in the context manager.
+RUN python - <<'PY'
+from importlib.util import find_spec
+from pathlib import Path
+root = Path(find_spec('sglang').origin).parent
+path = root / 'srt/layers/deep_gemm_wrapper/entrypoint.py'
+text = path.read_text()
+old = '    else:\n        original_num_sms = deep_gemm.get_num_sms()\n'
+new = '    else:\n        import deep_gemm\n        original_num_sms = deep_gemm.get_num_sms()\n'
+assert text.count(old) == 1, 'DeepGEMM SM-count context patch anchor changed'
+path.write_text(text.replace(old, new))
+PY
+
+RUN python -m pip check && python - <<'PY'
+import inspect
+from importlib.metadata import distribution, distributions, packages_distributions, version
+from importlib.util import find_spec
+from pathlib import Path
+import torch
+from cutlass import cute
+import quack.copy_utils  # Catch the Quack/CUTLASS API mismatch before model load.
+from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+assert torch.__version__ == '2.9.1+cu130' and torch.version.cuda == '13.0'
+assert version('kt-kernel') == '0.7.2'
+assert version('sgl-kernel') == '0.3.21+ds32.sm120'
+assert version('flashinfer-python') == '0.6.13+ds32'
+assert version('nvidia-cutlass-dsl') == '4.5.2'
+assert hasattr(cute.nvgpu, 'OperandMajorMode')
+assert {'backend', 'kv_scale_format', 'out', 'sparse_mla_top_k'} <= set(
+    inspect.signature(trtllm_batch_decode_with_kv_cache_mla).parameters)
+dg = Path(next(iter(find_spec('deep_gemm').submodule_search_locations)))
+assert list(dg.glob('_C*.so')), 'Missing source-built DeepGEMM extension'
+for package, fragment in [('kt-kernel', 'kt_kernel_ext'),
+                          ('sgl-kernel', 'sm100/common_ops')]:
+    dist = distribution(package)
+    assert any(fragment in str(p) and str(p).endswith('.so') and
+               dist.locate_file(p).is_file() for p in (dist.files or [])), package
+assert packages_distributions()['transformers'] == ['transformers-kt']
+names = {d.metadata['Name'].lower().replace('_', '-') for d in distributions()}
+assert not names & {'transformers', 'accelerate', 'flashinfer-cubin',
+                    'flashinfer-jit-cache'}
+assert not any(n.startswith('nvidia-') and n.endswith('-cu12') for n in names)
+print('Dependency and SM120 API checks passed; GPU/model tests remain external.')
+PY
+RUN python -m pip freeze --all > /opt/installed-packages.txt && nvcc --version
+
+WORKDIR /workspace
+EXPOSE 8000
+STOPSIGNAL SIGTERM
+# Inherit the NVIDIA entrypoint; supply the server command and options at runtime.
+CMD ["/bin/bash"]
