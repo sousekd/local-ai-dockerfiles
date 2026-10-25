@@ -1,0 +1,240 @@
+# syntax=docker/dockerfile:1.7
+# Diffbot DeepSeek-V4.1-Flash-1017 EXL3 on two RTX PRO 6000 Blackwell GPUs.
+# Self-contained build; model weights are supplied at runtime.
+
+ARG BASE_IMAGE=vllm/vllm-openai:nightly-5555a2d8f7116b2b4877f66516f4128176cf722a@sha256:8896fd7b29fc4ee7ce839f146cb4757984c476ec79d0234ffa8c995dee6e339a
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+USER root
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+ARG DIFFBOT_REPO=diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000
+ARG DIFFBOT_REVISION=4e691b368c9cb06855c058e80f244b251fed050b
+ARG SFXNZ_REVISION=460ac89c7df1eea4db8a731f1feb807f1584f359
+ARG VLLM_EXL3_REVISION=d3cfd394920360d69f820d2dc96f8292a9e10283
+ARG EXLLAMAV3_REVISION=5be886578ec80324c2c715269387be2058724b6e
+ARG BUILD_JOBS=16
+# CPU kernels use -march=native. Build on the serving host with its local builder.
+# BUILD_CPU_EXPERTS=0 omits the CPU runtime; GPU execution remains available.
+ARG BUILD_CPU_EXPERTS=1
+
+ENV VLLM_NO_USAGE_STATS=1 \
+    DO_NOT_TRACK=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    TORCH_CUDA_ARCH_LIST=12.0a \
+    MAX_JOBS=${BUILD_JOBS}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates git patch build-essential ninja-build clang-18 \
+      libcusparse-dev-13-0 libcusolver-dev-13-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Fetch only recipe source, scripts, plans and licenses. No model tensors.
+RUN python3 - <<'PY'
+import os
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id=os.environ["DIFFBOT_REPO"],
+    revision=os.environ["DIFFBOT_REVISION"],
+    allow_patterns=["recipe/*"],
+    local_dir="/opt/diffbot-source",
+)
+PY
+RUN mv /opt/diffbot-source/recipe /opt/recipe \
+    && rm -rf /opt/diffbot-source \
+    && printf '%s\n' "${DIFFBOT_REPO}@${DIFFBOT_REVISION}" > /opt/recipe/SOURCE_REVISION
+
+RUN git clone https://github.com/sfxnz/DeepSeek-V4.1-Flash-EXL3-vLLM-2x-DGX-Spark /tmp/sfxnz-recipe \
+    && git -C /tmp/sfxnz-recipe checkout --detach "${SFXNZ_REVISION}" \
+    && cp -a /tmp/sfxnz-recipe/docker/patch /opt/dsv41-patch \
+    && rm -rf /tmp/sfxnz-recipe
+
+# Apply Diffbot's patch series in its published order.
+RUN set -eux; \
+    VP=/usr/local/lib/python3.12/dist-packages; \
+    test -d "$VP/vllm"; \
+    cd "$VP"; \
+    for p in \
+      sm120-fixes \
+      v41-engram-post-lifetime \
+      pr59585-dsml-finite-args \
+      pr61039-length-aware-candidate-blocks \
+      pr61142-dsml-drifted-openers \
+      pr60792-v41-image-order \
+      pr62196-v41-1017-encoder \
+      v41-replay-final-window \
+      v41-encoder-api \
+      v41-parser-strict-dsml \
+      v41-indexer-chunked-decode; do \
+        patch --batch --fuzz=0 -p1 --forward --no-backup-if-mismatch \
+          < "/opt/recipe/patches/vllm/$p.diff"; \
+    done; \
+    find "$VP/vllm" -type d -name __pycache__ -prune -exec rm -rf {} +
+
+RUN python3 - <<'PY'
+import importlib
+modules = [
+    "vllm.models.deepseek_v41.decoder_replay_layers",
+    "vllm.models.deepseek_v41.attention",
+    "vllm.models.deepseek_v41.common.engram",
+    "vllm.models.deepseek_v41.nvidia.model",
+    "vllm.models.deepseek_v41.nvidia.flashinfer_sparse",
+    "vllm.models.deepseek_v41.nvidia.model_state",
+    "vllm.parser.deepseek_v4", "vllm.parser.deepseek_v41",
+    "vllm.renderers.deepseek_v4", "vllm.tokenizers.deepseek_v41",
+    "vllm.tokenizers.deepseek_v41_encoding",
+    "vllm.model_executor.layers.sparse_attn_indexer",
+]
+for name in modules:
+    importlib.import_module(name)
+print("Patched vLLM modules imported successfully")
+PY
+
+RUN git clone https://github.com/vcruz305/vllm-exl3.git /opt/vllm-exl3 \
+    && git -C /opt/vllm-exl3 checkout --detach "${VLLM_EXL3_REVISION}" \
+    && cd /opt/vllm-exl3 \
+    && patch --batch --fuzz=0 -p1 --forward --no-backup-if-mismatch \
+         < /opt/recipe/patches/vllm-exl3/exl3-sm120.patch \
+    && python3 /opt/dsv41-patch/fix_vllm_exl3_setup.py /opt/vllm-exl3/setup.py \
+    && VLLM_EXL3_NO_CUDA=1 python3 -m pip install --no-cache-dir --no-build-isolation --no-deps /opt/vllm-exl3 \
+    && python3 -c 'import vllm_exl3; print("vllm_exl3 import OK")' \
+    && rm -rf /opt/vllm-exl3
+
+RUN git clone https://github.com/turboderp-org/exllamav3.git /opt/exllamav3 \
+    && git -C /opt/exllamav3 checkout --detach "${EXLLAMAV3_REVISION}" \
+    && python3 -m pip install --no-cache-dir --no-build-isolation --no-deps /opt/exllamav3 \
+    && python3 -c 'import torch, exllamav3, exllamav3_ext; assert hasattr(exllamav3_ext, "exl3_moe"); print("ExLlamaV3 import OK")' \
+    && rm -rf /opt/exllamav3
+
+# Compile both prefill math variants and the TP2 kernels without a GPU.
+WORKDIR /opt/recipe/kernels
+RUN python3 build_xmoe.py xmoe xmoe \
+    && python3 build_xmoe_do.py \
+    && python3 build_xmoe_do_i8.py \
+    && python3 build_fp8ar.py \
+    && python3 build_rowtopk.py
+
+RUN case "${BUILD_CPU_EXPERTS}" in \
+      1) bash /opt/recipe/cpuexp/check_host.sh --isa \
+         && bash /opt/recipe/cpuexp/build_inner.sh ;; \
+      0) echo 'CPU expert runtime omitted; GPU-only execution remains available' ;; \
+      *) echo 'BUILD_CPU_EXPERTS must be 0 or 1' >&2; exit 1 ;; \
+    esac
+
+# Generate a foreground entrypoint from the pinned upstream settings section.
+RUN python3 - <<'PY'
+from pathlib import Path
+source = Path("/opt/recipe/serve/serve.sh").read_text()
+start = 'PORT=${PORT:-8000}'
+end = '# pass-through into the container:'
+assert source.count(start) == source.count(end) == 1, "Upstream launcher layout changed"
+settings = source[source.index(start):source.index(end)]
+old = 'CACHE_DIR=${CACHE_DIR:-$REPO/.cache}'
+assert old in settings
+settings = settings.replace(old, 'CACHE_DIR=${CACHE_DIR:-/root/.cache}')
+old = 'SERVED=${SERVED:-deepseek-v4.1-flash}'
+assert old in settings
+settings = settings.replace(old, 'SERVED=${SERVED:-${SERVED_MODEL_NAME:-deepseek-v4.1-flash}}')
+settings = "\n".join(line for line in settings.splitlines() if not line.startswith('WARMUP=')) + "\n"
+# Restrict the launcher to the TP2 kernels compiled above.
+prefix = '''#!/usr/bin/env bash
+set -euo pipefail
+REPO=/opt/recipe
+PACK=${1:-${MODEL_PATH:-/model}}
+if (( $# )); then shift; fi
+# Accept local model directories and resolve Hub IDs from the offline cache.
+if [[ ! -f $PACK/config.json ]]; then
+  PACK=$(python3 - "$PACK" <<'PY_MODEL'
+import os
+import sys
+from pathlib import Path
+from huggingface_hub import snapshot_download
+from huggingface_hub.utils import validate_repo_id
+value = sys.argv[1]
+try:
+    validate_repo_id(value)
+    path = snapshot_download(
+        repo_id=value,
+        revision=os.environ.get("MODEL_REVISION") or "main",
+        local_files_only=True,
+    )
+    if not (Path(path) / "config.json").is_file():
+        raise FileNotFoundError(f"config.json is missing in {path}")
+except Exception as exc:
+    sys.exit(f"Cannot resolve model {value!r} from the local cache: {exc}. "
+             "Pass a model snapshot directory or a cached repo ID, and set HF_HUB_CACHE to the mounted Hub root.")
+print(path)
+PY_MODEL
+  )
+fi
+MODELS_DIR=$(dirname "$PACK")
+[[ ${TP:-2} == 2 && ${PROFILE:-2x} == 2x ]] || {
+  echo 'This image supports the two-GPU TP2 profile only.' >&2; exit 2;
+}
+export CPU_EXPERTS_STRICT=${CPU_EXPERTS_STRICT:-1}
+unset EXL3_CPU_EXPERTS EXL3_CPU_EXPERTS_PREFILL
+'''
+# Upstream settings contain conditionals that return 1; retain their shell semantics.
+prefix += 'set +e\n'
+suffix = r'''
+set -e
+export XMOE_EXT
+export FLASHINFER_CUDA_ARCH_LIST="$FI_ARCH"
+export PYTORCH_CUDA_ALLOC_CONF=${ALLOC_CONF:-expandable_segments:True}
+export TILELANG_CACHE_DIR="$CACHE_DIR/tilelang"
+export TRITON_CACHE_DIR="$CACHE_DIR/triton"
+auth=()
+[[ -z ${API_KEY:-} ]] || auth+=(--api-key "$API_KEY")
+echo "[diffbot] TP2; CPU experts=$CPU_EXPERTS; CPU prefill=$CPU_EXPERTS_PREFILL; context=$MAX_MODEL_LEN; KV bytes/GPU=$KV_MEM"
+echo "[diffbot] plan=$PLAN; host cache=$EXL3_HOST_CACHE; drafter=$DS41_DRAFTER; speculation=$SPEC k=$SPEC_K; int8 prefill=$DO_INT8; 8-bit prefill all-reduce=$DS41_FP8AR"
+exec vllm serve "$PACK" \
+  --tensor-parallel-size 2 --host 0.0.0.0 --port "$PORT" "${auth[@]}" \
+  --max-model-len "$MAX_MODEL_LEN" --kv-cache-dtype fp8 --kv-cache-memory "$KV_MEM" \
+  --gpu-memory-utilization "$UTIL" --max-num-seqs "$MAX_NUM_SEQS" --max-num-batched-tokens "$MAX_BATCHED" \
+  --kernel-config '{"enable_flashinfer_autotune":false,"enable_jit_warmup":false}' \
+  --block-size 64 --quantization exl3 $([[ $VISION == 1 ]] || echo --language-model-only) \
+  --tokenizer-mode deepseek_v41 --tool-call-parser deepseek_v41 --enable-auto-tool-choice \
+  --reasoning-parser deepseek_v41 \
+  --served-model-name "$SERVED" --trust-remote-code "${extra[@]}" "$@"
+'''
+target = Path("/usr/local/bin/diffbot-serve")
+target.write_text(prefix + settings + suffix)
+target.chmod(0o755)
+PY
+RUN bash -n /usr/local/bin/diffbot-serve \
+    && install -m 0644 /opt/recipe/patches/vllm/sitecustomize.py /usr/lib/python3.12/sitecustomize.py
+
+ENV VLLM_PLUGINS=vllm_exl3 \
+    DSV41_ENGRAM_DISK=0 \
+    DSV41_ENGRAM_INT4=1 \
+    FLASHINFER_DISABLE_VERSION_CHECK=1 \
+    VLLM_ENGINE_READY_TIMEOUT_S=3600 \
+    VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD=0 \
+    NCCL_P2P_DISABLE=0 \
+    NCCL_CUMEM_ENABLE=0 \
+    NCCL_DEBUG=WARN \
+    CUDA_DEVICE_ORDER=PCI_BUS_ID \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    CPU_EXPERTS=0 \
+    CPU_EXPERTS_PREFILL=1
+
+# Record the resolved environment for build reports and troubleshooting.
+RUN python3 -m pip freeze --all > /opt/installed-packages.txt
+
+LABEL org.opencontainers.image.title="Diffbot DeepSeek V4.1 Flash EXL3 TP2" \
+      org.opencontainers.image.description="Pinned Diffbot EXL3 TP2 serving stack for SM120 with optional native CPU experts" \
+      org.opencontainers.image.source="https://github.com/sousekd/local-ai-dockerfiles" \
+      ds41.recipe.repository="${DIFFBOT_REPO}" \
+      ds41.recipe.revision="${DIFFBOT_REVISION}" \
+      ds41.vllm-exl3.revision="${VLLM_EXL3_REVISION}" \
+      ds41.exllamav3.revision="${EXLLAMAV3_REVISION}" \
+      ds41.sfxnz.revision="${SFXNZ_REVISION}" \
+      ds41.cpu-experts-built="${BUILD_CPU_EXPERTS}"
+
+WORKDIR /opt/recipe
+EXPOSE 8000
+ENTRYPOINT ["/usr/local/bin/diffbot-serve"]
+CMD []

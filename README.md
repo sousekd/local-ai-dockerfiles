@@ -17,4 +17,5 @@ The configurations are hardware-oriented working recipes rather than universal i
 - [GLM 5 Next — SGLang + KTransformers v1](models/glm-5/sglang-ktransformers-next-v1.md) (for GLM 5.3 Flash)
 - [Kimi K2 — SGLang + KTransformers v3](models/kimi-k2/sglang-ktransformers-v3.md) (for Kimi K2.5, 2.6 and 2.7 Code)
 - [DeepSeek V3.2 — SGLang + KTransformers v2](models/deepseek-v3.2/sglang-ktransformers-v2.md) (for DeepSeek V3.2 FP8)
+- [DeepSeek V4.1 — vLLM + EXL3 v1](models/deepseek-v4.1/vllm-exl3-diffbot-v1.md) (for V4.1 Flash 1017 EXL3, using [Diffbot's recipe](https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000))
 
