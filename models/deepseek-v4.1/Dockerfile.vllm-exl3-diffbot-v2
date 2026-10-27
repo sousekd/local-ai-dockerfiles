@@ -11,7 +11,7 @@ USER root
 ARG DEBIAN_FRONTEND=noninteractive
 
 ARG DIFFBOT_REPO=diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000
-ARG DIFFBOT_REVISION=4e691b368c9cb06855c058e80f244b251fed050b
+ARG DIFFBOT_REVISION=451f7dcb8ecb0502a963f3314e16b34c5a8ce5ae
 ARG SFXNZ_REVISION=460ac89c7df1eea4db8a731f1feb807f1584f359
 ARG VLLM_EXL3_REVISION=d3cfd394920360d69f820d2dc96f8292a9e10283
 ARG EXLLAMAV3_REVISION=5be886578ec80324c2c715269387be2058724b6e
@@ -67,7 +67,8 @@ RUN set -eux; \
       v41-replay-final-window \
       v41-encoder-api \
       v41-parser-strict-dsml \
-      v41-indexer-chunked-decode; do \
+      v41-indexer-chunked-decode \
+      v41-namespaces-thinking; do \
         patch --batch --fuzz=0 -p1 --forward --no-backup-if-mismatch \
           < "/opt/recipe/patches/vllm/$p.diff"; \
     done; \
@@ -86,6 +87,8 @@ modules = [
     "vllm.renderers.deepseek_v4", "vllm.tokenizers.deepseek_v41",
     "vllm.tokenizers.deepseek_v41_encoding",
     "vllm.model_executor.layers.sparse_attn_indexer",
+    "vllm.tool_parsers.utils",
+    "vllm.entrypoints.openai.chat_completion.protocol",
 ]
 for name in modules:
     importlib.import_module(name)

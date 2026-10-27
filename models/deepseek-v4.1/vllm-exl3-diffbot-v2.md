@@ -1,8 +1,8 @@
-# DeepSeek V4.1 — vLLM + EXL3 v1
+# DeepSeek V4.1 — vLLM + EXL3 v2
 
 Convenience Dockerfile for [Diffbot's DeepSeek V4.1 Flash EXL3 recipe](https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000) on two NVIDIA Blackwell GPUs. The quantization, patches, kernels and tuning come from Diffbot and the upstream projects credited there.
 
-- [Dockerfile](Dockerfile.vllm-exl3-diffbot-v1)
+- [Dockerfile](Dockerfile.vllm-exl3-diffbot-v2)
 - [Diffbot deployment documentation](https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000/blob/main/recipe/README.md)
 - [Upstream notices and licenses](https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000/blob/main/recipe/THIRD_PARTY_NOTICES.md)
 
@@ -11,7 +11,7 @@ The image packages the pinned recipe and provides a foreground OpenAI-compatible
 ## Tested configuration
 
 - Model: `diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000`, Flash 1017 release
-- Model and recipe revision: `4e691b368c9cb06855c058e80f244b251fed050b`
+- Benchmark model and recipe revision: `4e691b368c9cb06855c058e80f244b251fed050b`
 - GPU: 2 × NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 96 GB each, 350 W per GPU
 - CPU: AMD EPYC 9355 Turin
 - VM memory: approximately 740 GiB
@@ -35,6 +35,8 @@ The image packages the pinned recipe and provides a foreground OpenAI-compatible
 
 The base image is pinned by digest, and recipe and component sources are pinned by commit in the Dockerfile. The build applies Diffbot's patches, compiles the TP2 kernels and records Python packages in `/opt/installed-packages.txt`.
 
+The Dockerfile uses recipe revision [`451f7dc`](https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000/commit/451f7dcb8ecb0502a963f3314e16b34c5a8ce5ae), including all 12 upstream vLLM patches. The 25 October update preserves tool namespaces and makes explicit thinking settings take precedence over `reasoning_effort` in prompt rendering and response parsing. Weights and kernels are unchanged; the cached model revision below remains usable. Rebuild the image and restart to apply the fixes.
+
 ## Build
 
 Run from the repository root:
@@ -43,8 +45,8 @@ Run from the repository root:
 DOCKER_BUILDKIT=1 docker build --progress=plain \
   --build-arg BUILD_JOBS=24 \
   --build-arg BUILD_CPU_EXPERTS=1 \
-  -t diffbot-ds41f:v1 \
-  - < models/deepseek-v4.1/Dockerfile.vllm-exl3-diffbot-v1
+  -t diffbot-ds41f:v2 \
+  - < models/deepseek-v4.1/Dockerfile.vllm-exl3-diffbot-v2
 ```
 
 Only the Dockerfile is required as local build input. The build downloads source code, including the recipe from Hugging Face, but no model weights. A CUDA 13-compatible driver and NVIDIA Container Toolkit are required for serving.
@@ -57,7 +59,7 @@ Set the local Hugging Face cache and a writable runtime-cache directory:
 
 ```bash
 HF_HUB_CACHE=/path/to/huggingface/hub
-RUNTIME_CACHE=/path/to/diffbot-ds41f-v1-cache
+RUNTIME_CACHE=/path/to/diffbot-ds41f-v2-cache
 MODEL_REPO=diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000
 MODEL_REVISION=4e691b368c9cb06855c058e80f244b251fed050b
 
@@ -91,7 +93,7 @@ docker run --rm \
   -e MAX_BATCHED=16384 \
   -e SPEC_K=5 \
   -p 8000:8000 \
-  diffbot-ds41f:v1 "${MODEL_REPO}" \
+  diffbot-ds41f:v2 "${MODEL_REPO}" \
   --safetensors-load-strategy prefetch \
   --enable-request-id-headers \
   --enable-force-include-usage \
@@ -109,7 +111,7 @@ The entrypoint resolves cached model IDs offline; a local snapshot directory is 
 
 `KV_OFFLOAD_GB` is GiB total across workers. The native tier uses pinned host memory backed by `/dev/shm`; `--shm-size` is its capacity limit, not a separate RAM reservation. The tier is temporary and disappears when the container exits. It retains reusable prefixes beyond the GPU cache; the active-request GPU KV capacity and per-request context limit still apply.
 
-For a smaller-memory launch, set `KV_OFFLOAD_GB=0` and use `--shm-size=64g`. With offload enabled, retain `ALLOC_CONF=expandable_segments:False`. The same runtime-cache directory can be reused across context sizes and expert-execution modes.
+For a smaller-memory launch, set `KV_OFFLOAD_GB=0` and use `--shm-size=64g`. With offload enabled, retain `ALLOC_CONF=expandable_segments:False`. The same runtime-cache directory can be reused across context sizes and expert-execution modes. An existing v1 runtime-cache directory can also be reused with v2; no cleanup is required.
 
 **Optional CPU-assisted expert execution has not been tested or benchmarked for this recipe.** With `BUILD_CPU_EXPERTS=1`, set `CPU_EXPERTS=1` at runtime. `CPU_EXPERTS_PREFILL=0` limits CPU assistance to decode; its default of `1` also enables CPU prefill. CPU expert execution and CPU KV caching are independent settings. See [Diffbot's CPU runtime documentation](https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000/blob/main/recipe/cpuexp/README.md).
 
