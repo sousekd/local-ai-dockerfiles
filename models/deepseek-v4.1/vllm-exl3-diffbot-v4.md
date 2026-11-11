@@ -68,17 +68,6 @@ docker run --rm --name deepseek-v4.1-flash \
 
 Set `SERVED_MODEL_NAME` to change the API model ID from `deepseek-v4.1-flash`. For bearer authentication, export `API_KEY` and pass `-e API_KEY` before the image name.
 
-## GPU KV capacity
-
-| Profile | Context limit | FP8 KV per GPU | Reported GPU KV tokens | Estimated full-context concurrency |
-|---|---:|---:|---:|---:|
-| [Diffbot default KV profile](https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000/blob/2205b2520c1aefd92d4fbd46f58ff1bffdc589ea/recipe/results/raw/ctx1m-1017.txt) | 1,048,576 | 4.25 GiB | 1,071,558 | 1.02× |
-| v4 512K | 524,288 | 4 GiB | 813,859 | 1.55× |
-
-For 512K, pass `-e MAX_MODEL_LEN=524288 -e KV_MEM=4294967296` before the image name.
-
-vLLM estimates concurrency from available GPU blocks and the blocks required per full-length request, including sliding-window blocks for in-flight prefill. Reported token capacity is that estimate multiplied by the context limit. [vLLM cache sizing](https://github.com/vllm-project/vllm/blob/5555a2d8f7116b2b4877f66516f4128176cf722a/vllm/v1/core/kv_cache_utils.py#L981-L1048)
-
 ## Verify
 
 If `API_KEY` is configured, include `-H "Authorization: Bearer $API_KEY"` on the completion request.
