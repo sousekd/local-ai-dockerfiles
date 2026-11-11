@@ -26,11 +26,10 @@ CPU expert overlays are selected only when the CPU runtime is active and `DS41_C
 
 ## Build
 
-Run from the repository root. The build fetches recipe and kernel sources. The checkpoint is supplied at launch.
+Build from the repository root.
 
 ```bash
 DOCKER_BUILDKIT=1 docker build --progress=plain \
-  --build-arg BUILD_JOBS=24 \
   -t diffbot-ds41f:v4 \
   - < models/deepseek-v4.1/Dockerfile.vllm-exl3-diffbot-v4
 ```
@@ -52,14 +51,13 @@ hf download "$MODEL_REPO" --revision "$MODEL_REVISION" --cache-dir "$HF_HUB_CACH
   --include 'model-*.safetensors' --include '*.json'
 ```
 
-Mount the whole Hub cache so snapshot symlinks resolve. The entrypoint accepts a cached Hub ID or a local model directory mounted inside the container. Expose the two intended GPUs. Extra arguments after the model go to `vllm serve`.
+Mount the full Hub cache and a writable runtime cache. The model argument accepts a cached Hub ID or a local directory inside the container. Subsequent arguments go to `vllm serve`.
 
 ```bash
 docker run --rm --name deepseek-v4.1-flash \
   --init --ipc=private --shm-size=32g \
-  --cap-add=SYS_NICE --cap-add=IPC_LOCK \
-  --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=1048576:1048576 \
-  --runtime=nvidia --gpus all \
+  --cap-add=IPC_LOCK --ulimit memlock=-1:-1 \
+  --gpus all \
   -v "$HF_HUB_CACHE:/models:ro" \
   -v "$RUNTIME_CACHE:/root/.cache:rw" \
   -e HF_HUB_CACHE=/models -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
@@ -68,28 +66,22 @@ docker run --rm --name deepseek-v4.1-flash \
   diffbot-ds41f:v4 "$MODEL_REPO"
 ```
 
-The default served model name is `deepseek-v4.1-flash`. Set `SERVED_MODEL_NAME` to override it. To require bearer authentication, export `API_KEY` and pass `-e API_KEY` before the image name. Keep the writable runtime cache between launches to reuse compiled and tuned kernels.
+Set `SERVED_MODEL_NAME` to change the API model ID from `deepseek-v4.1-flash`. For bearer authentication, export `API_KEY` and pass `-e API_KEY` before the image name.
 
-## Tested 512K configuration
+## GPU KV capacity
 
-Apply these Docker overrides before the image name. Replace the shared memory limit in the example with `--shm-size=384g`.
+| Profile | Context limit | FP8 KV per GPU | Reported GPU KV tokens | Estimated full-context concurrency |
+|---|---:|---:|---:|---:|
+| [Diffbot default KV profile](https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000/blob/2205b2520c1aefd92d4fbd46f58ff1bffdc589ea/recipe/results/raw/ctx1m-1017.txt) | 1,048,576 | 4.25 GiB | 1,071,558 | 1.02× |
+| v4 512K | 524,288 | 4 GiB | 813,859 | 1.55× |
 
-| Override | Value |
-|---|---|
-| `MAX_MODEL_LEN` | `524288` |
-| `KV_MEM` | `4294967296` bytes per GPU |
-| `KV_OFFLOAD_GB` | `256` GiB shared host KV tier |
-| `ALLOC_CONF` | `expandable_segments:False` |
+For 512K, pass `-e MAX_MODEL_LEN=524288 -e KV_MEM=4294967296` before the image name.
 
-The shared host KV tier needs additional host RAM and `/dev/shm` space. This setup reported **813,859 GPU KV tokens** and an estimated **1.55× concurrency** at the full 524,288-token limit. The cold launch reached API readiness in about **21 minutes**, including **17m 28s** of model loading. All seven warmup requests returned HTTP 200 in **36s**. The run confirmed INT8 expert prefill, 8-bit prefill all-reduce, FlashInfer PCIe IPC during CUDA graph capture, and writes to the host KV tier.
-
-The tested launch also appended `--enable-request-id-headers`, `--enable-force-include-usage`, `--enable-per-request-metrics`, and `--enable-prompt-tokens-details` after the model argument.
-
-For startup comparisons on VirtioFS, test `--safetensors-load-strategy prefetch` after the model argument. The cold run used the default loader, which skipped automatic prefetch on VirtioFS.
+vLLM estimates concurrency from available GPU blocks and the blocks required per full-length request, including sliding-window blocks for in-flight prefill. Reported token capacity is that estimate multiplied by the context limit. [vLLM cache sizing](https://github.com/vllm-project/vllm/blob/5555a2d8f7116b2b4877f66516f4128176cf722a/vllm/v1/core/kv_cache_utils.py#L981-L1048)
 
 ## Verify
 
-Wait for `[warmup] done` before collecting timings. If `API_KEY` is configured, include `-H "Authorization: Bearer $API_KEY"` on the completion request.
+If `API_KEY` is configured, include `-H "Authorization: Bearer $API_KEY"` on the completion request.
 
 ```bash
 curl -fsS http://127.0.0.1:8000/health
@@ -104,5 +96,3 @@ curl -fsS http://127.0.0.1:8000/v1/chat/completions \
     "max_tokens": 128
   }'
 ```
-
-For benchmark reports, record the recipe and checkpoint revisions, context, KV settings, and any request or engine overrides. With the pinned checkpoint, omitted chat sampling parameters use `temperature=1.0` and `top_p=1.0`.
