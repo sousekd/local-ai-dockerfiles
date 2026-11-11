@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1.7
 # Diffbot DeepSeek-V4.1-Flash-1017 EXL3 on two RTX PRO 6000 Blackwell GPUs.
 # Self-contained build; model weights are supplied at runtime.
+# Serving defaults and CPU overlay selection follow the pinned Diffbot recipe.
+# The foreground launcher accepts cached Hub IDs and optional API authentication.
 
 ARG BASE_IMAGE=vllm/vllm-openai:nightly-5555a2d8f7116b2b4877f66516f4128176cf722a@sha256:8896fd7b29fc4ee7ce839f146cb4757984c476ec79d0234ffa8c995dee6e339a
 FROM ${BASE_IMAGE}
@@ -9,6 +11,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 USER root
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG PIP_DISABLE_PIP_VERSION_CHECK=1
 
 ARG DIFFBOT_REPO=diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000
 ARG DIFFBOT_REVISION=2205b2520c1aefd92d4fbd46f58ff1bffdc589ea
@@ -18,16 +21,15 @@ ARG EXLLAMAV3_REVISION=5be886578ec80324c2c715269387be2058724b6e
 ARG BUILD_JOBS=16
 # CPU kernels use -march=native. Build on the serving host with its local builder.
 # BUILD_CPU_EXPERTS=0 omits the CPU runtime; GPU execution remains available.
-ARG BUILD_CPU_EXPERTS=1
+ARG BUILD_CPU_EXPERTS=0
+ARG MAX_JOBS=${BUILD_JOBS}
 
 ENV VLLM_NO_USAGE_STATS=1 \
     DO_NOT_TRACK=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    TORCH_CUDA_ARCH_LIST=12.0a \
-    MAX_JOBS=${BUILD_JOBS}
+    TORCH_CUDA_ARCH_LIST=12.0a
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates git patch build-essential ninja-build clang-18 \
+      ca-certificates curl git patch build-essential ninja-build clang-18 \
       libcusparse-dev-13-0 libcusolver-dev-13-0 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -95,7 +97,7 @@ for name in modules:
 print("Patched vLLM modules imported successfully")
 PY
 
-# Preserve the patched baseline for per-launch overlay selection.
+# Preserve the patched baseline and the unmodified upstream CPU overlays.
 RUN python3 - <<'PY'
 from pathlib import Path
 import py_compile
@@ -114,47 +116,29 @@ for relative, overlay in mapping.items():
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(package / relative, target)
     py_compile.compile(str(overlays / overlay), doraise=True)
-
-# Keep cached token IDs alive while another request may evict their memo entries.
-memo = overlays / "deepseek_v41_memo.py"
-source = memo.read_text()
-old = '            todo = [r for r in dict.fromkeys(regions) if r and r not in memo]'
-new = '''            # Local fix: retain entries across concurrent memo eviction.
-            cached = {r: memo[r] for r in dict.fromkeys(regions) if r and r in memo}
-            todo = [r for r in dict.fromkeys(regions) if r and r not in cached]'''
-assert source.count(old) == 1, "Upstream tokenizer memo layout changed"
-source = source.replace(old, new)
-old = '''                        got = memo[region]
-                        memo.move_to_end(region)'''
-new = '''                        got = cached[region]
-                        if region in memo:
-                            memo.move_to_end(region)'''
-assert source.count(old) == 1, "Upstream tokenizer memo lookup changed"
-memo.write_text(source.replace(old, new))
-py_compile.compile(str(memo), doraise=True)
 PY
 
 RUN cat > /usr/local/bin/diffbot-select-overlays.py <<'PY'
-import os
 from pathlib import Path
 import shutil
+import sys
 
 package = Path("/usr/local/lib/python3.12/dist-packages/vllm")
 baseline = Path("/opt/diffbot-vllm-baseline")
 overlays = Path("/opt/recipe/patches/vllm")
 mapping = (
-    ("models/deepseek_v41/decoder_replay_layers.py", "decoder_replay_layers_skip.py", "VLLM_DS41_REPLAY_SKIP"),
-    ("models/deepseek_v41/nvidia/model_state.py", "model_state_skip.py", "VLLM_DS41_REPLAY_SKIP"),
-    ("tokenizers/deepseek_v41.py", "deepseek_v41_memo.py", "DS41_TOKENIZER_MEMO"),
+    ("models/deepseek_v41/decoder_replay_layers.py", "decoder_replay_layers_skip.py"),
+    ("models/deepseek_v41/nvidia/model_state.py", "model_state_skip.py"),
+    ("tokenizers/deepseek_v41.py", "deepseek_v41_memo.py"),
 )
-for relative, overlay, switch in mapping:
+use_cpu_overlays = sys.argv[1] == "1"
+for relative, overlay in mapping:
     target = package / relative
-    source = overlays / overlay if os.environ[switch] == "1" else baseline / relative
+    source = overlays / overlay if use_cpu_overlays else baseline / relative
     shutil.copyfile(source, target)
     for cached in (target.parent / "__pycache__").glob(target.stem + ".*.pyc"):
         cached.unlink()
-print("[diffbot] replay skip=" + os.environ["VLLM_DS41_REPLAY_SKIP"]
-      + "; tokenizer memo=" + os.environ["DS41_TOKENIZER_MEMO"], flush=True)
+print(f"[diffbot] upstream CPU overlays={int(use_cpu_overlays)}", flush=True)
 PY
 
 RUN git clone https://github.com/vcruz305/vllm-exl3.git /opt/vllm-exl3 \
@@ -202,19 +186,32 @@ settings = settings.replace(old, 'CACHE_DIR=${CACHE_DIR:-/root/.cache}')
 old = 'SERVED=${SERVED:-deepseek-v4.1-flash}'
 assert old in settings
 settings = settings.replace(old, 'SERVED=${SERVED:-${SERVED_MODEL_NAME:-deepseek-v4.1-flash}}')
-settings = "\n".join(line for line in settings.splitlines() if not line.startswith('WARMUP=')) + "\n"
-# The foreground launcher selects these files inside the container.
+# Select exactly the overlays mounted by upstream's CPU speedup branch.
 lines = settings.splitlines()
 mount_lines = [line for line in lines if 'DOCKER_EXTRA=' in line]
 assert len(mount_lines) == 1 and all(name in mount_lines[0] for name in (
     'decoder_replay_layers_skip.py', 'model_state_skip.py', 'deepseek_v41_memo.py'
 )), "Upstream overlay mounts changed"
-settings = "\n".join(line for line in lines if 'DOCKER_EXTRA=' not in line
-                     and line.strip() != 'VP=/usr/local/lib/python3.12/dist-packages/vllm') + "\n"
+settings = settings.replace(mount_lines[0], '    use_cpu_overlays=1')
+settings = "\n".join(line for line in settings.splitlines()
+                     if line.strip() != 'VP=/usr/local/lib/python3.12/dist-packages/vllm') + "\n"
+# Reuse the upstream warmup payloads and request order inside the container.
+warmup_start = 'if [[ $WARMUP == 1 ]]; then\n'
+warmup_end = 'docker run --rm --name "$NAME"'
+assert source.count(warmup_start) == source.count(warmup_end) == 1
+warmup = source[source.index(warmup_start):source.index(warmup_end)]
+# Upstream continues its warmup sequence after a failed request.
+assert warmup.count('  ( t0=') == 1
+warmup = warmup.replace('  ( t0=', '  ( set +e; t0=')
+# Prompt generation needs only the standard library, without serving hooks.
+assert warmup.count('python3 -c') == 1
+warmup = warmup.replace('python3 -c', 'python3 -S -c')
 # Restrict the launcher to the TP2 kernels compiled above.
 prefix = '''#!/usr/bin/env bash
 set -euo pipefail
 REPO=/opt/recipe
+API_KEY=${API_KEY-}
+use_cpu_overlays=0
 PACK=${1:-${MODEL_PATH:-/model}}
 if (( $# )); then shift; fi
 # Accept local model directories and resolve Hub IDs from the offline cache.
@@ -242,33 +239,23 @@ print(path)
 PY_MODEL
   )
 fi
-MODELS_DIR=$(dirname "$PACK")
+MODELS_DIR=${MODELS_DIR:-$(dirname "$PACK")}
+[[ $PACK == "$MODELS_DIR"/* ]] || MODELS_DIR=$(dirname "$PACK")
 [[ ${TP:-2} == 2 && ${PROFILE:-2x} == 2x ]] || {
   echo 'This image supports the two-GPU TP2 profile only.' >&2; exit 2;
 }
-export CPU_EXPERTS_STRICT=${CPU_EXPERTS_STRICT:-1}
-unset EXL3_CPU_EXPERTS EXL3_CPU_EXPERTS_PREFILL
 '''
 # Upstream settings contain conditionals that return 1; retain their shell semantics.
 prefix += 'set +e\n'
 suffix = r'''
 set -e
-# Match upstream CPU defaults; permit the exact replay/tokenizer optimizations on GPU execution.
-overlay_default=0
-if [[ $CPU_EXPERTS == 1 && ${DS41_CPU_SPEEDUPS:-1} == 1 ]]; then
-  overlay_default=1
-fi
-export VLLM_DS41_REPLAY_SKIP=${VLLM_DS41_REPLAY_SKIP:-$overlay_default}
-export DS41_TOKENIZER_MEMO=${DS41_TOKENIZER_MEMO:-$overlay_default}
-for switch in VLLM_DS41_REPLAY_SKIP DS41_TOKENIZER_MEMO; do
-  [[ ${!switch} == 0 || ${!switch} == 1 ]] || {
-    echo "$switch must be 0 or 1" >&2; exit 2;
-  }
-done
-python3 -S /usr/local/bin/diffbot-select-overlays.py
+python3 -S /usr/local/bin/diffbot-select-overlays.py "$use_cpu_overlays"
 export XMOE_EXT
 export FLASHINFER_CUDA_ARCH_LIST="$FI_ARCH"
-export PYTORCH_CUDA_ALLOC_CONF=${ALLOC_CONF:-expandable_segments:True}
+export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-0}
+if [[ -n ${NO_CUSTOM_AR:-} ]]; then
+  export PYTORCH_CUDA_ALLOC_CONF=${ALLOC_CONF-expandable_segments:True}
+fi
 export TILELANG_CACHE_DIR="$CACHE_DIR/tilelang"
 export TRITON_CACHE_DIR="$CACHE_DIR/triton"
 auth=()
@@ -276,6 +263,9 @@ auth=()
 echo "[diffbot] TP2; CPU experts=$CPU_EXPERTS; CPU prefill=$CPU_EXPERTS_PREFILL; context=$MAX_MODEL_LEN; KV bytes/GPU=$KV_MEM"
 echo "[diffbot] plan=$PLAN; host cache=$EXL3_HOST_CACHE; drafter=$DS41_DRAFTER; speculation=$SPEC k=$SPEC_K; int8 prefill=$DO_INT8; 8-bit prefill all-reduce=$DS41_FP8AR"
 echo "[diffbot] recipe=$(cat /opt/recipe/SOURCE_REVISION); FP8 lm_head=$DS41_FP8_LMHEAD; MXFP8 tactic=${DS41_MXFP8_TACTIC:-default}"
+'''
+suffix += warmup
+suffix += r'''
 exec vllm serve "$PACK" \
   --tensor-parallel-size 2 --host 0.0.0.0 --port "$PORT" "${auth[@]}" \
   --max-model-len "$MAX_MODEL_LEN" --kv-cache-dtype fp8 --kv-cache-memory "$KV_MEM" \
@@ -284,7 +274,7 @@ exec vllm serve "$PACK" \
   --block-size 64 --quantization exl3 $([[ $VISION == 1 ]] || echo --language-model-only) \
   --tokenizer-mode deepseek_v41 --tool-call-parser deepseek_v41 --enable-auto-tool-choice \
   --reasoning-parser deepseek_v41 \
-  --served-model-name "$SERVED" --trust-remote-code "${extra[@]}" "$@"
+  --served-model-name "$SERVED" --trust-remote-code "${extra[@]}" ${EXTRA_ARGS:-} "$@"
 '''
 target = Path("/usr/local/bin/diffbot-serve")
 target.write_text(prefix + settings + suffix)
@@ -293,6 +283,7 @@ PY
 RUN bash -n /usr/local/bin/diffbot-serve \
     && install -m 0644 /opt/recipe/patches/vllm/sitecustomize.py /usr/lib/python3.12/sitecustomize.py
 
+# Effective environment supplied by upstream's TP2 launcher. Docker -e can override it.
 ENV VLLM_PLUGINS=vllm_exl3 \
     DSV41_ENGRAM_DISK=0 \
     DSV41_ENGRAM_INT4=1 \
@@ -301,26 +292,21 @@ ENV VLLM_PLUGINS=vllm_exl3 \
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD=0 \
     NCCL_P2P_DISABLE=0 \
     NCCL_CUMEM_ENABLE=0 \
-    NCCL_DEBUG=WARN \
-    CUDA_DEVICE_ORDER=PCI_BUS_ID \
-    HF_HUB_OFFLINE=1 \
-    TRANSFORMERS_OFFLINE=1 \
-    CPU_EXPERTS=0 \
-    CPU_EXPERTS_PREFILL=1
+    NCCL_DEBUG=WARN
 
 # Record the resolved environment for build reports and troubleshooting.
 RUN python3 -m pip freeze --all > /opt/installed-packages.txt
 
 LABEL org.opencontainers.image.title="Diffbot DeepSeek V4.1 Flash EXL3 TP2" \
-      org.opencontainers.image.version="3" \
-      org.opencontainers.image.description="Pinned Diffbot EXL3 TP2 serving stack for SM120 with optional native CPU experts" \
+      org.opencontainers.image.version="4" \
+      org.opencontainers.image.description="Pinned Diffbot EXL3 TP2 serving defaults for SM120 with optional native CPU experts" \
       org.opencontainers.image.source="https://github.com/sousekd/local-ai-dockerfiles" \
       ds41.recipe.repository="${DIFFBOT_REPO}" \
       ds41.recipe.revision="${DIFFBOT_REVISION}" \
       ds41.vllm-exl3.revision="${VLLM_EXL3_REVISION}" \
       ds41.exllamav3.revision="${EXLLAMAV3_REVISION}" \
       ds41.sfxnz.revision="${SFXNZ_REVISION}" \
-      ds41.local-fixes="tokenizer-memo-concurrent-eviction" \
+      ds41.vllm.series="sm120-fixes v41-engram-post-lifetime pr59585-dsml-finite-args pr61039-length-aware-candidate-blocks pr61142-dsml-drifted-openers pr60792-v41-image-order pr62196-v41-1017-encoder v41-replay-final-window v41-encoder-api v41-parser-strict-dsml v41-indexer-chunked-decode v41-namespaces-thinking" \
       ds41.cpu-experts-built="${BUILD_CPU_EXPERTS}"
 
 WORKDIR /opt/recipe
